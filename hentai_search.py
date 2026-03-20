@@ -10,7 +10,6 @@ hentai_search.py — 查本子功能独立模块
 配置项（对应 _conf_schema.json）：
   jm_base_url     18Comic 域名，默认 https://18comic.vip
   nh_base_url     NHentai 域名，默认 https://nhentai.net
-  cf_proxy_url    Cloudflare Worker 代理 URL（JM/DL/EH 共用）
   nvidia_api_key  NVIDIA NIM API Key（用于 AI 多语言翻译）
   nvidia_model    翻译模型名，默认 meta/llama-3.3-70b-instruct
 """
@@ -30,28 +29,31 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# 繁简字符映射表（模块级常量，避免每次调用重建）
+# 覆盖本子/同人标题中常见的繁体字、旧字体、异体字
+# ---------------------------------------------------------------------------
+_TRAD_TO_SIMP = str.maketrans(
+    "記來術數廣歡戀變覺體學習藝歷傳說話夢劍鬥殺獸魔龍獵師戰艦艷漢澤緒彌綾繪紗縣諸賀總聲顯憂憐戲劇齊憶愛",
+    "记来术数广欢恋变觉体学习艺历传说话梦剑斗杀兽魔龙猎师战舰艳汉泽绪弥绫绘纱县诸贺总声显忧怜戏剧齐忆爱",
+)
+
+# ---------------------------------------------------------------------------
 # 核心搜索器（无框架依赖）
 # ---------------------------------------------------------------------------
 
 class HentaiSearcher:
     """
-    四站并发搜索器：JM / NH / EH / DL
+    双站并发搜索器：JM / NH
     可在任意 asyncio 环境中独立使用。
-
-    使用示例：
-        searcher = HentaiSearcher(config={...})
-        result = await searcher.search(char="桐人", source="刀剑神域")
-        print(result.format_text())
     """
 
-    def __init__(self, config: dict, en_cache_fn=None):
-        self.jm_base    = config.get("jm_base_url",  "https://18comic.vip").rstrip("/")
-        self.nh_base    = config.get("nh_base_url",  "https://nhentai.net").rstrip("/")
-        self.nvidia_api_key = config.get("nvidia_api_key", "")
-        self.nvidia_model   = config.get("nvidia_model",   "meta/llama-3.3-70b-instruct")
-        # 回调：(char, source) -> str | None，返回角色英文名，查不到返回 None
-        # 由 main.py 注入，避免模块间循环依赖
-        self._en_cache_fn = en_cache_fn
+    def __init__(self, config: dict, en_cache_fn=None, en_cache_write_fn=None):
+        self.jm_base            = config.get("jm_base_url",  "https://18comic.vip").rstrip("/")
+        self.nh_base            = config.get("nh_base_url",  "https://nhentai.net").rstrip("/")
+        self.nvidia_api_key     = config.get("nvidia_api_key", "")
+        self.nvidia_model       = config.get("nvidia_model",   "meta/llama-3.3-70b-instruct")
+        self._en_cache_fn       = en_cache_fn
+        self._en_cache_write_fn = en_cache_write_fn
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -59,20 +61,16 @@ class HentaiSearcher:
 
     async def search(self, char: str, source: str = "") -> "SearchResult":
         """
-        主入口：根据角色名+作品名进行多语言多站搜索。
+        主入口：角色名+作品名 → 多语言多站搜索。
 
-        执行流程（两阶段）：
-          阶段一：JM（中文词有效）与 LLM 翻译并发
-                  LLM 用于获取 en_source / en_char / alt_char，补全搜索词
-          阶段二：LLM 结果出来后，NH / EH / DL 用英文词并发搜
-          pick_best 用完整 keywords 从候选池选最相关 ID
-
-        en_cache 命中时 en_name 已知，LLM 仍跑（取 en_source），
-        总延迟 ≈ max(JM延迟, LLM延迟)，NH/EH/DL 在阶段二再并发。
+        流程：
+          阶段一：JM中文搜索 与 LLM翻译 并发
+          阶段二：JM标签页补搜 + NH 并发
+          pick_best 用完整关键词库评分选最优 ID
         """
         display = f"《{source}》{char}" if source else char
-        char   = char.strip()
-        source = source.strip()
+        char    = char.strip()
+        source  = source.strip()
 
         VTUBER_AGENCIES = {
             "ホロライブ", "hololive", "にじさんじ", "nijisanji",
@@ -81,7 +79,7 @@ class HentaiSearcher:
         source_is_agency = source.lower() in VTUBER_AGENCIES
         combined = f"{source} {char}".strip() if source and not source_is_agency else ""
 
-        # ── 查 en_cache ──────────────────────────────────────────────
+        # en_cache 查询
         en_name_cached = ""
         if self._en_cache_fn:
             try:
@@ -89,85 +87,69 @@ class HentaiSearcher:
             except Exception:
                 pass
 
-        async def query_site(search_fn, queries: list) -> list:
-            """轮询：依次尝试每个 query，拿到结果就返回"""
-            for q in queries:
-                items = await search_fn(q)
-                if items:
-                    return items
-            return []
-
-        async def query_merged(search_fn, queries_a: list, queries_b: list) -> list:
-            """两路并发搜索，结果合并去重。
-            两路都强制搜（不再因为英文路有结果就跳过中文路），
-            让 pick_best 在完整候选池里用关键词评分选最佳。
-            """
-            tasks = []
-            if queries_a:
-                tasks.append(query_site(search_fn, queries_a))
-            if queries_b:
-                # 中文路也强制搜，不依赖英文路是否有结果
-                tasks.append(query_site(search_fn, queries_b))
-            if not tasks:
-                return []
-            results = await asyncio.gather(*tasks)
-            seen, merged = set(), []
-            for items in results:
-                for iid, title in items:
-                    if iid not in seen:
-                        seen.add(iid)
-                        merged.append((iid, title))
-            return merged
-
-        # ── 阶段一：JM 与 LLM 翻译并发 ──────────────────────────────
-        # JM 搜中文词有效，不依赖 LLM 结果，可以和翻译同时跑
-        # LLM 目的：取 en_source / en_char / short_source / alt_char / kana_char
+        # 阶段一：JM中文 + LLM 并发
         jm_items_zh, trans = await asyncio.gather(
-            query_merged(self._search_jm, [combined] if combined else [], [char]),
+            self._query_merged(self._search_jm,
+                               [combined] if combined else [],
+                               [char]),
             self._ai_translate_multi(char, source),
         )
 
-        # ── 解析 LLM 结果 ────────────────────────────────────────────
-        en_name   = en_name_cached or (trans.get("en_char") or "").strip()
+        # 解析 LLM 结果
+        en_name   = en_name_cached or (trans.get("en_char")     or "").strip()
         en_source = (trans.get("en_source")    or "").strip()
         short_src = (trans.get("short_source") or "").strip()
         ja_char   = (trans.get("ja_char")      or "").strip()
+        kana_char = (trans.get("kana_char")    or "").strip()
         alt_chars = [a.strip() for a in (trans.get("alt_char") or []) if a.strip()]
         is_vtuber = bool(trans.get("is_vtuber"))
         if is_vtuber:
             short_src = ""
 
-        # "Anzai Chiyomi Girls und Panzer" —— 能直接命中 NH/EH 标题
         en_combined = (
             f"{en_name} {en_source}".strip()
             if en_name and en_source and not is_vtuber else en_name
         )
 
-        # NH 搜索词：英文+中文并行
         nh_q_en  = list(dict.fromkeys(filter(None, [en_name, en_combined])))
         nh_q_raw = list(dict.fromkeys(filter(None, [char, combined])))
 
-        kana_char = (trans.get("kana_char") or "").strip()
-
         logger.info(
             f"[查本子] char={char!r} source={source!r} "
-            f"en={en_name!r} en_source={en_source!r} short={short_src!r} | "
-            f"JM已完成({len(jm_items_zh)}条) NH={nh_q_en or nh_q_raw}"
+            f"en={en_name!r} en_source={en_source!r} | "
+            f"JM中文已完成({len(jm_items_zh)}条)"
         )
 
-        # ── JM 补搜：用 kana_char/ja_char 补一次，合并去重 ──────────
+        # JM 补搜：kana/ja
         jm_extra_q = list(dict.fromkeys(filter(None, [kana_char, ja_char])))
         if jm_extra_q:
-            jm_extra = await query_merged(self._search_jm, jm_extra_q, [])
+            jm_extra = await self._query_merged(self._search_jm, jm_extra_q, [])
             seen_jm  = {iid for iid, _ in jm_items_zh}
-            jm_items = jm_items_zh + [(iid, t) for iid, t in jm_extra if iid not in seen_jm]
+            jm_items_base = jm_items_zh + [
+                (iid, t) for iid, t in jm_extra if iid not in seen_jm
+            ]
         else:
-            jm_items = jm_items_zh
+            jm_items_base = jm_items_zh
 
-        _nh_from_tag = False
+        # 阶段二：JM标签页 + NH 并发
         _jm_from_tag = False
+        _nh_from_tag = False
 
-        async def _nh_with_tag_fallback() -> list:
+        async def _jm_pipeline() -> list:
+            nonlocal _jm_from_tag
+            for tag_q in filter(None, [kana_char]):  # JM是中文站，只用假名，不用英文名
+                tag_items = await self._search_jm_tag(tag_q)
+                if tag_items:
+                    _jm_from_tag = True
+                    # 标签页结果 + 普通搜索结果合并，候选池更大
+                    seen   = {iid for iid, _ in tag_items}
+                    merged = tag_items + [
+                        (iid, t) for iid, t in jm_items_base if iid not in seen
+                    ]
+                    return merged
+            return jm_items_base
+
+        async def _nh_pipeline() -> list:
             nonlocal _nh_from_tag
             if en_name:
                 tag_items = await self._search_nh_tag(en_name)
@@ -179,34 +161,21 @@ class HentaiSearcher:
                     if tag_items:
                         _nh_from_tag = True
                         return tag_items
-            return await query_merged(self._search_nh, nh_q_en, nh_q_raw)
+            return await self._query_merged(self._search_nh, nh_q_en, nh_q_raw)
 
-        async def _jm_with_tag_fallback() -> list:
-            """JM 标签页：用 kana_char 或 en_name 走标签页，全量返回供随机取"""
-            nonlocal _jm_from_tag
-            for tag_q in filter(None, [kana_char, en_name] + alt_chars):
-                tag_items = await self._search_jm_tag(tag_q)
-                if tag_items:
-                    _jm_from_tag = True
-                    return tag_items
-            return jm_items
-
-        # ── 阶段二：JM标签页 / NH 并发 ──────────────────────────────
-        nh_items, jm_items = await asyncio.gather(
-            _nh_with_tag_fallback(),
-            _jm_with_tag_fallback(),
+        jm_items, nh_items = await asyncio.gather(
+            _jm_pipeline(),
+            _nh_pipeline(),
         )
 
-        # ── 回写 en_cache ────────────────────────────────────────────
-        if en_name and not en_name_cached:
+        # 回写 en_cache
+        if en_name and not en_name_cached and self._en_cache_write_fn:
             try:
-                write_fn = getattr(self, "_en_cache_write_fn", None)
-                if write_fn:
-                    write_fn(char, source, en_name, alt_chars)
+                self._en_cache_write_fn(char, source, en_name, alt_chars)
             except Exception:
                 pass
 
-        # ── keywords + pick_best ─────────────────────────────────────
+        # 构建关键词库
         all_keywords = list(dict.fromkeys(filter(None, [
             char, source,
             en_name, en_source, short_src,
@@ -215,13 +184,19 @@ class HentaiSearcher:
 
         logger.info(f"[查本子] jm({len(jm_items)}) nh({len(nh_items)})")
         logger.info(f"[查本子] keywords={all_keywords}")
-        logger.info(f"[查本子] JM={[(i,t[:25]) for i,t in jm_items[:5]]}")
-        logger.info(f"[查本子] NH={[(i,t[:25]) for i,t in nh_items[:5]]}")
+        logger.info(f"[查本子] JM前5={[(i, t[:30]) for i, t in jm_items[:5]]}")
+        logger.info(f"[查本子] NH前5={[(i, t[:30]) for i, t in nh_items[:5]]}")
 
-        jm_id = random.choice(jm_items)[0] if (jm_items and _jm_from_tag) else self._pick_best(jm_items, all_keywords)
-        nh_id = random.choice(nh_items)[0] if (nh_items and _nh_from_tag) else self._pick_best(nh_items, all_keywords)
+        # pick_best：评分优先，score全0时有结果就随机兜底
+        jm_id = self._pick_best(jm_items, all_keywords)
+        if jm_id is None and jm_items:
+            jm_id = random.choice(jm_items)[0]
 
-        logger.info(f"[查本子] jm_id={jm_id} nh_id={nh_id}")
+        nh_id = self._pick_best(nh_items, all_keywords)
+        if nh_id is None and nh_items:
+            nh_id = random.choice(nh_items)[0]
+
+        logger.info(f"[查本子] 最终 jm_id={jm_id} nh_id={nh_id}")
 
         jm_title = next((t for rid, t in jm_items if rid == jm_id), "") if jm_id else ""
         nh_title = next((t for rid, t in nh_items if rid == nh_id), "") if nh_id else ""
@@ -234,181 +209,171 @@ class HentaiSearcher:
             nh_base=self.nh_base,
         )
 
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 内部：搜索辅助
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _query_site(search_fn, queries: list) -> list:
+        """全部查询都跑完，结果合并去重，候选池最大化。"""
+        seen, merged = set(), []
+        for q in queries:
+            items = await search_fn(q)
+            for iid, title in items:
+                if iid not in seen:
+                    seen.add(iid)
+                    merged.append((iid, title))
+        return merged
+
+    @staticmethod
+    async def _query_merged(search_fn, queries_a: list, queries_b: list) -> list:
+        """两路并发，结果合并去重，让 pick_best 在完整候选池里评分。"""
+        tasks = []
+        if queries_a:
+            tasks.append(HentaiSearcher._query_site(search_fn, queries_a))
+        if queries_b:
+            tasks.append(HentaiSearcher._query_site(search_fn, queries_b))
+        if not tasks:
+            return []
+        results = await asyncio.gather(*tasks)
+        seen, merged = set(), []
+        for items in results:
+            for iid, title in items:
+                if iid not in seen:
+                    seen.add(iid)
+                    merged.append((iid, title))
+        return merged
+
+    # ------------------------------------------------------------------
     # 内部：各站搜索
     # ------------------------------------------------------------------
 
     async def _search_jm(self, q: str) -> list:
-        """
-        搜索 18Comic（禁漫天堂）。
-        使用 jmcomic 库的 API client，绕过 Cloudflare 网页验证。
-        """
-        def _sync_search():
+        """搜索 18Comic，使用 jmcomic 库绕过 Cloudflare。"""
+        def _sync():
             import jmcomic
-            # 关闭 stderr 日志噪音
-            import logging as _logging
-            _logging.getLogger("jmcomic").setLevel(_logging.ERROR)
-            option = jmcomic.JmOption.default()
-            client = option.new_jm_client()
-            res = client.search_site(search_query=q)
-            return list(res)[:30]
+            import logging as _lg
+            _lg.getLogger("jmcomic").setLevel(_lg.ERROR)
+            client = jmcomic.JmOption.default().new_jm_client()
+            return list(client.search_site(search_query=q))[:30]
 
         try:
-            result = await asyncio.to_thread(_sync_search)
+            result = await asyncio.to_thread(_sync)
             logger.info(f"[查本子] JM搜索 {q!r} -> {len(result)} 条")
-            return result  # 已经是 (album_id, title) tuple 列表
+            return result
         except Exception as e:
             logger.error(f"[查本子] JM搜索失败: {e}")
             return []
 
     async def _search_jm_tag(self, q: str) -> list:
-        """
-        JM 标签页搜索：用角色名（日文假名/英文）走 JM 的女角色标签。
-        返回该标签下所有本子，供随机取一条。
-        """
-        def _sync_tag():
+        """JM 角色标签页（main_tag=3），失败时退回普通搜索。"""
+        def _sync():
             import jmcomic
-            import logging as _logging
-            _logging.getLogger("jmcomic").setLevel(_logging.ERROR)
-            option = jmcomic.JmOption.default()
-            client = option.new_jm_client()
-            # JM 标签搜索：main_tag=3 为角色标签
+            import logging as _lg
+            _lg.getLogger("jmcomic").setLevel(_lg.ERROR)
+            client = jmcomic.JmOption.default().new_jm_client()
             try:
-                res = client.search_site(search_query=q, main_tag=3)
-                items = list(res)[:50]
+                items = list(client.search_site(search_query=q, main_tag=3))[:50]
                 if items:
                     return items
             except Exception:
                 pass
-            # 退回普通搜索
             try:
-                res = client.search_site(search_query=q)
-                return list(res)[:30]
+                return list(client.search_site(search_query=q))[:30]
             except Exception:
                 return []
 
         try:
-            result = await asyncio.to_thread(_sync_tag)
+            result = await asyncio.to_thread(_sync)
             logger.info(f"[查本子] JM标签页 {q!r} -> {len(result)} 条")
-            return result
+            return result or []
         except Exception as e:
             logger.error(f"[查本子] JM标签页失败: {e}")
             return []
 
     async def _search_nh_tag(self, en_char: str) -> list:
-        """
-        走 NHentai 角色标签页取本子，100% 角色相关。
-        en_char 转成 danbooru slug：小写，空格→连字符。
-        """
+        """NHentai 角色标签页。标签页403时自动fallback到关键词搜索页。"""
         try:
             import html as html_lib
-            slug = re.sub(r'\s+', '-', en_char.strip().lower())
-            # 随机选页，增加结果多样性（先抓第1页确认标签存在，再随机页）
+            from curl_cffi.requests import AsyncSession
+            slug     = re.sub(r'\s+', '-', en_char.strip().lower())
             page_num = random.randint(1, 5)
-            url  = f"{self.nh_base}/tag/character:{slug}/?sort=popular&page={page_num}"
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-            async with aiohttp.ClientSession(headers=headers) as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 404:
-                        logger.info(f"[查本子] NH标签页不存在: {slug}")
-                        return []
-                    if r.status != 200:
-                        logger.warning(f"[查本子] NH标签页状态码: {r.status}")
-                        return []
-                    page = await r.text()
-
-            pairs_raw = re.findall(
-                r'href="/g/(\d+)/[^"]*"[^>]*>.*?<div class="caption">(.*?)</div>',
-                page, re.S
-            )
-            if not pairs_raw:
-                pairs_raw = re.findall(
-                    r'href="/g/(\d+)/[^"]*"[^>]*title="([^"]+)"', page
+            url      = f"{self.nh_base}/tag/character:{slug}/?sort=popular&page={page_num}"
+            async with AsyncSession() as s:
+                r = await s.get(
+                    url, impersonate="chrome124",
+                    headers={"Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20,
                 )
-            pairs = [
-                (iid, html_lib.unescape(re.sub(r'<[^>]+>', '', t).strip()))
-                for iid, t in pairs_raw if t.strip()
-            ]
+            if r.status_code == 404:
+                logger.info(f"[查本子] NH标签不存在: character:{slug}")
+                return []
+            if r.status_code != 200:
+                # 标签页被封，fallback 到关键词搜索
+                logger.warning(f"[查本子] NH标签页{r.status_code}，fallback到搜索页: {en_char!r}")
+                return await self._search_nh(en_char)
+            page = r.text
+            pairs = self._parse_nh_page(page, html_lib)
             logger.info(f"[查本子] NH标签页 character:{slug} -> {len(pairs)} 条")
             return pairs[:30]
         except Exception as e:
             logger.error(f"[查本子] NH标签页失败: {e}")
             return []
 
+
     async def _search_nh(self, q: str) -> list:
-        """
-        搜索 NHentai。
-        标题从 <div class='caption'> 内的 <div class='title'> 或 <p class='title'> 取，
-        不是从 .caption 本身取（.caption 是标签栏，不是标题）。
-        """
+        """NHentai 关键词搜索，curl_cffi 绕过 Cloudflare 403。"""
         try:
             import html as html_lib
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-            async with aiohttp.ClientSession(headers=headers) as s:
-                async with s.get(
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession() as s:
+                r = await s.get(
                     f"{self.nh_base}/search/?q={quote(q)}",
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as r:
-                    if r.status != 200:
-                        logger.warning(f"[查本子] NH搜索状态码: {r.status}")
-                        return []
-                    page = await r.text()
-
-            # 联合提取 ID + caption（nhentai 搜索结果实际结构）
-            pairs_raw = re.findall(
-                r'href="/g/(\d+)/[^"]*"[^>]*>.*?<div class="caption">(.*?)</div>',
-                page, re.S
-            )
-            if not pairs_raw:
-                # 备用1：href title 属性
-                pairs_raw = re.findall(
-                    r'href="/g/(\d+)/[^"]*"[^>]*title="([^"]+)"',
-                    page
+                    impersonate="chrome124",
+                    headers={"Accept-Language": "en-US,en;q=0.9"},
+                    timeout=20,
                 )
-            if not pairs_raw:
-                # 备用2：分开提取 id + class=title
-                _ids = re.findall(r'href="/g/(\d+)/"', page)
-                _titles = re.findall(
-                    r'class=["\']+title["\']+[^>]*>(.*?)</(?:div|p)>',
-                    page, re.S
-                )
-                pairs_raw = list(zip(_ids, _titles))
-
-            if not pairs_raw:
-                return []
-
-            pairs = [
-                (iid, html_lib.unescape(re.sub(r'<[^>]+>', '', t).strip()))
-                for iid, t in pairs_raw
-                if t.strip()
-            ]
+                if r.status_code != 200:
+                    logger.warning(f"[查本子] NH搜索状态码: {r.status_code}")
+                    return []
+                page = r.text
+            pairs = self._parse_nh_page(page, html_lib)
             logger.info(f"[查本子] NH搜索 {q!r} -> {len(pairs)} 条")
             return pairs[:30]
         except Exception as e:
             logger.error(f"[查本子] NH搜索失败: {e}")
             return []
 
+    @staticmethod
+    def _parse_nh_page(page: str, html_lib) -> list:
+        """从 NHentai HTML 提取 (id, title)，三级备用策略。"""
+        pairs_raw = re.findall(
+            r'href="/g/(\d+)/[^"]*"[^>]*>.*?<div class="caption">(.*?)</div>',
+            page, re.S
+        )
+        if not pairs_raw:
+            pairs_raw = re.findall(
+                r'href="/g/(\d+)/[^"]*"[^>]*title="([^"]+)"', page
+            )
+        if not pairs_raw:
+            _ids    = re.findall(r'href="/g/(\d+)/"', page)
+            _titles = re.findall(
+                r'class=["\']title["\'][^>]*>(.*?)</(?:div|p)>', page, re.S
+            )
+            pairs_raw = list(zip(_ids, _titles))
+        if not pairs_raw:
+            return []
+        return [
+            (iid, html_lib.unescape(re.sub(r'<[^>]+>', '', t).strip()))
+            for iid, t in pairs_raw if t.strip()
+        ]
+
     # ------------------------------------------------------------------
     # 内部：AI 翻译
     # ------------------------------------------------------------------
 
     async def _ai_translate_multi(self, char: str, source: str = "") -> dict:
-        """
-        调用 NVIDIA NIM LLM，一次性返回角色/作品的多语言信息。
-        无 API Key 时立即返回空 dict（不发请求，不阻塞）。
-        """
+        """调用 NVIDIA NIM LLM 取多语言信息。无 Key 时直接返回空 dict。"""
         if not char or not self.nvidia_api_key:
             return {}
 
@@ -435,7 +400,8 @@ class HentaiSearcher:
             "- ja_char: Japanese kana/kanji name. '' if unknown.\n"
             "- kana_char: Katakana reading. '' if unknown.\n"
             "- alt_char: list of aliases/romanizations used on doujin sites. [] if none.\n"
-            "- en_source: official English title used by the franchise itself (e.g. 'BlazBlue' not 'Azure Grimoire'). MUST NOT be a literal translation of the Chinese/Japanese title. '' if unknown or unsure.\n"
+            "- en_source: official English title used by the franchise itself. "
+            "MUST NOT be a literal translation. '' if unknown.\n"
             "- ja_source: full Japanese series title. '' if unknown.\n"
             "- short_source: abbreviated series title used on doujin/booru. '' if VTuber or none.\n"
             "- is_vtuber: true if VTuber talent, false otherwise.\n"
@@ -452,13 +418,13 @@ class HentaiSearcher:
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": self.nvidia_model,
-                        "messages": [
+                        "model":       self.nvidia_model,
+                        "messages":    [
                             {"role": "system", "content": system_prompt},
                             {"role": "user",   "content": subject},
                         ],
                         "temperature": 0.0,
-                        "max_tokens": 400,
+                        "max_tokens":  400,
                     },
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as r:
@@ -483,52 +449,48 @@ class HentaiSearcher:
 
     @staticmethod
     def _normalize_title(title: str) -> str:
-        """
-        标准化标题：
-        1. 打码字符（●○＊*×）替换成空格
-        2. 中日高频异体字统一为简体（本子标题常见繁体/旧字体）
-        """
+        """打码字符→空格，繁体/旧字体→简体。"""
         title = re.sub(r'[●○＊*×]', ' ', title)
-        VARIANTS = str.maketrans(
-            "記來術數廣歡戀變覺體學習藝歷傳說話夢劍鬥殺獸魔龍獵師戰艦艷漢",
-            "记来术数广欢恋变觉体学习艺历传说话梦剑斗杀兽魔龙猎师战舰艳汉",
-        )
-        return title.translate(VARIANTS)
+        return title.translate(_TRAD_TO_SIMP)
 
     @staticmethod
     def _kw_match(keyword: str, title_normalized: str) -> bool:
         """
-        关键词匹配，支持打码通配。
-        直接包含 → 命中；否则按空格/打码符切片，各片段都在标题里 → 命中。
+        关键词匹配，支持打码通配：
+        - ≤2字符：整词边界匹配
+        - 普通：直接包含
+        - 含打码：切片各段都在标题里
         """
         kw = keyword.lower()
         t  = title_normalized.lower()
-        # 短词（≤2字符，如 "es"）用整词匹配，避免误命中任意含该字母的单词
         if len(kw) <= 2:
-            return bool(re.search(r'(?<![a-z0-9])' + re.escape(kw) + r'(?![a-z0-9])', t))
+            return bool(re.search(
+                r'(?<![a-z0-9])' + re.escape(kw) + r'(?![a-z0-9])', t
+            ))
         if kw in t:
             return True
         parts = [p for p in re.split(r'[\s●○＊*×]+', kw) if len(p) >= 2]
-        if not parts:
-            return False
-        return all(p in t for p in parts)
+        return bool(parts) and all(p in t for p in parts)
 
     @classmethod
     def _pick_best(cls, items: list, keywords: list) -> str | None:
         """
-        从搜索结果里选最相关的条目，返回 ID。
-        所有结果 score=0（完全无关）时返回 None，宁缺毋滥。
+        从候选列表选最相关条目，返回 ID。
+        score 全 0 时返回 None（宁缺毋滥）。
+        同分时随机取一条。
         """
         if not items:
             return None
         kws = [k.lower() for k in keywords if k]
+        if not kws:
+            return None
 
         def score(title: str) -> int:
             normalized = cls._normalize_title(title)
             return sum(1 for k in kws if cls._kw_match(k, normalized))
 
-        scored  = [(score(title), iid) for iid, title in items]
-        max_s   = max(s for s, _ in scored)
+        scored = [(score(title), iid) for iid, title in items]
+        max_s  = max(s for s, _ in scored)
         if max_s == 0:
             return None
         return random.choice([iid for s, iid in scored if s == max_s])
@@ -539,7 +501,7 @@ class HentaiSearcher:
 # ---------------------------------------------------------------------------
 
 class SearchResult:
-    """封装四站搜索结果，提供格式化输出。"""
+    """封装双站搜索结果，提供格式化输出。"""
 
     def __init__(
         self,
@@ -564,8 +526,7 @@ class SearchResult:
         return not any([self.jm_id, self.nh_id])
 
     @staticmethod
-    def _fmt_title(title: str, limit: int = 10) -> str:
-        """截断标题，超出加省略号"""
+    def _fmt_title(title: str, limit: int = 20) -> str:
         if not title:
             return ""
         return title[:limit] + "…" if len(title) > limit else title
@@ -578,10 +539,9 @@ class SearchResult:
             return f"{label}: {id_} | {t}" if t else f"{label}: {id_}"
 
         lines = [
-            line("JM",    self.jm_id, self.jm_title),
-            line("NH",    self.nh_id, self.nh_title),
+            line("JM", self.jm_id, self.jm_title),
+            line("NH", self.nh_id, self.nh_title),
         ]
-
         header = (
             f"未找到「{self.display}」的相关本子～"
             if self.all_not_found
@@ -591,15 +551,11 @@ class SearchResult:
 
 
 # ---------------------------------------------------------------------------
-# AstrBot 事件处理 Mixin（死代码，main.py 已直接调 HentaiSearcher，保留备用）
+# AstrBot 事件处理 Mixin
 # ---------------------------------------------------------------------------
 
 class HentaiSearchHandler:
-    """
-    AstrBot 插件 Mixin，提供「要本子」指令处理逻辑。
-    main.py 里 WifePlugin 已直接持有 HentaiSearcher 实例，
-    本 Mixin 仅作为备用独立插件场景使用。
-    """
+    """备用 AstrBot Mixin，main.py 已直接使用 HentaiSearcher。"""
 
     def _get_searcher(self) -> HentaiSearcher:
         if not hasattr(self, "_hentai_searcher"):
@@ -616,11 +572,10 @@ class HentaiSearchHandler:
 
 
 # ---------------------------------------------------------------------------
-# 独立测试入口（不依赖 AstrBot）
+# 独立测试入口
 # ---------------------------------------------------------------------------
 
 async def _demo():
-    """命令行快速测试：python hentai_search.py"""
     config = {
         "jm_base_url":    os.getenv("JM_BASE_URL",    "https://18comic.vip"),
         "nh_base_url":    os.getenv("NH_BASE_URL",    "https://nhentai.net"),
@@ -628,7 +583,7 @@ async def _demo():
         "nvidia_model":   os.getenv("NVIDIA_MODEL",   "meta/llama-3.3-70b-instruct"),
     }
     searcher = HentaiSearcher(config)
-    result   = await searcher.search(char="我妻由乃", source="未来日記")
+    result   = await searcher.search(char="平泽唯", source="轻音少女")
     print(result.format_text())
 
 

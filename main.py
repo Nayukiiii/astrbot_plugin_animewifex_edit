@@ -6,6 +6,8 @@ import os
 import json
 import aiohttp
 import asyncio
+import io
+from PIL import Image as PilImage
 import re
 from urllib.parse import quote
 from .hentai_search import HentaiSearcher
@@ -461,6 +463,19 @@ class WifePlugin(Star):
                 async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
                     if r.status == 200:
                         data = await r.read()
+                        try:
+                            pil_img = PilImage.open(io.BytesIO(data)).convert("RGB")
+                            quality = 85
+                            while True:
+                                buf = io.BytesIO()
+                                pil_img.save(buf, format="JPEG", quality=quality)
+                                if buf.tell() <= 400 * 1024 or quality <= 20:
+                                    break
+                                quality -= 10
+                            data = buf.getvalue()
+                            logger.info(f"[老婆图片] 压缩后大小: {len(data)/1024:.1f}KB (quality={quality})")
+                        except Exception as ce:
+                            logger.warning(f"[老婆图片] 压缩失败，使用原图: {ce}")
                         b64 = _b64.b64encode(data).decode()
                         return Image.fromBase64(b64)
                     else:
