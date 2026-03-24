@@ -2,6 +2,7 @@ from astrbot.api.all import *
 from astrbot.api.star import StarTools
 from datetime import datetime, timedelta
 import random
+import secrets
 import os
 import json
 import aiohttp
@@ -11,6 +12,7 @@ from PIL import Image as PilImage
 import re
 from urllib.parse import quote
 from .hentai_search import HentaiSearcher
+from .karma import KarmaSystem, _roll
 
 # ==================== 常量定义 ====================
 
@@ -28,7 +30,9 @@ SWAP_REQUESTS_FILE = os.path.join(CONFIG_DIR, "swap_requests.json")
 NTR_STATUS_FILE = os.path.join(CONFIG_DIR, "ntr_status.json")
 ADD_SESSIONS_FILE = os.path.join(CONFIG_DIR, "add_sessions.json")
 PENDING_FILE = os.path.join(CONFIG_DIR, "pending.json")
-EN_CACHE_FILE = os.path.join(CONFIG_DIR, "en_cache.json")  # 角色名→英文名缓存
+EN_CACHE_FILE    = os.path.join(CONFIG_DIR, "en_cache.json")    # 角色名→英文名缓存
+DRAWN_POOL_FILE  = os.path.join(CONFIG_DIR, "drawn_pool.json")   # 去重池
+KARMA_GROUPS_FILE = os.path.join(CONFIG_DIR, "karma_groups.json") # 分群业力配置
 
 # ==================== 全局数据存储 ====================
 
@@ -37,8 +41,10 @@ records = {  # 统一的记录数据结构
     "change": {},     # 换老婆记录
     "reset": {},      # 重置使用次数
     "swap": {},       # 交换老婆请求次数
-    "dengge_resets": {}  # 每日重置换成功次数（用于邓哥曾姐概率惩罚）
+    "karma_resets": {}  # 每日重置换成功次数（用于业力系统）
 }
+drawn_pool   = {}   # 去重池 {gid: {uid: [img, ...]}}
+_karma_cache = {}   # 每群 KarmaSystem 实例缓存 {gid: KarmaSystem}
 swap_requests = {}  # 交换请求数据
 ntr_statuses = {}   # NTR 开关状态
 add_sessions = {}        # 添老婆选角色临时会话 {gid: {uid: {candidates, expire_time}}}
@@ -132,6 +138,18 @@ def save_pending():
     save_json(PENDING_FILE, pending_queue)
 
 
+def load_drawn_pool():
+    """加载去重池"""
+    raw = load_json(DRAWN_POOL_FILE)
+    drawn_pool.clear()
+    drawn_pool.update(raw)
+
+
+def save_drawn_pool():
+    """保存去重池"""
+    save_json(DRAWN_POOL_FILE, drawn_pool)
+
+
 # ==================== 数据加载和保存函数 ====================
 
 def load_records():
@@ -143,7 +161,7 @@ def load_records():
         "change": raw.get("change", {}),
         "reset": raw.get("reset", {}),
         "swap": raw.get("swap", {}),
-        "dengge_resets": raw.get("dengge_resets", {})
+        "karma_resets": raw.get("karma_resets", {})
     })
 
 
@@ -180,6 +198,7 @@ load_swap_requests()
 load_ntr_statuses()
 load_add_sessions()
 load_pending()
+load_drawn_pool()
 
 # ==================== 主插件类 ====================
 
@@ -225,11 +244,74 @@ class WifePlugin(Star):
         self.admin_qq      = self.config.get("admin_qq")
         self.pixiv_refresh_token = self.config.get("pixiv_refresh_token")
         # eh/nvidia 配置由 HentaiSearcher 自行从 config 读取，此处不再单独存储
-        # 邓哥曾姐惩罚相关配置
-        self.dengge_img          = self.config.get("dengge_img", "")           # 邓哥图片路径（list.txt 中的相对路径）
-        self.zengjie_img         = self.config.get("zengjie_img", "")          # 曾姐图片路径（list.txt 中的相对路径）
-        self.dengge_base_prob    = self.config.get("dengge_base_prob", 0.15)   # 每次重置换成功后增加的概率
-        self.dengge_max_prob     = self.config.get("dengge_max_prob", 0.80)    # 概率上限
+        # 业力系统全局默认配置（各群未单独配置时 fallback 到这里）
+        self._karma_global_cfg = {
+            "punishment_imgs": [
+                self.config.get("karma_img1", ""),
+                self.config.get("karma_img2", ""),
+            ],
+            "base_prob" : self.config.get("karma_base_prob", 0.15),
+            "max_prob"  : self.config.get("karma_max_prob", 0.80),
+            "up_char"   : self.config.get("up_char", ""),
+            "up_prob"   : self.config.get("up_prob", 0.10),
+            "lock_chars"  : [s.strip() for s in self.config.get("lock_char", "").split(",") if s.strip()],
+            "up_pool"       : [],
+            "up_pool_prob"  : self.config.get("up_pool_prob", 0.05),
+        }
+        # 去重池重置角色（全局）
+        self.reset_char = self.config.get("reset_char", "")
+        # 群组业力缓存清空（重载配置时重建）
+        _karma_cache.clear()
+
+
+    def _get_karma(self, gid: str) -> KarmaSystem:
+        """按群返回对应的 KarmaSystem 实例。
+        优先读取 karma_groups.json 中的群配置，没有则 fallback 到全局默认配置。
+        结果缓存在 _karma_cache 中，重启或重载插件时自动清空重建。
+
+        karma_groups.json 格式（存放于 CONFIG_DIR）：
+        {
+            "群号": {
+                "karma_img1": "来源!角色.jpg",
+                "karma_img2": "来源!角色.jpg",
+                "base_prob": 0.15,
+                "max_prob": 0.80,
+                "up_char": "",
+                "up_prob": 0.10,
+                "lock_chars": []
+            }
+        }
+        """
+        if gid in _karma_cache:
+            return _karma_cache[gid]
+
+        group_cfgs = load_json(KARMA_GROUPS_FILE)
+        gcfg = group_cfgs.get(gid, {})
+
+        def _get(key, default):
+            return gcfg[key] if key in gcfg else self._karma_global_cfg.get(key, default)
+
+        if gcfg:
+            punishment_imgs = [
+                gcfg.get("karma_img1", ""),
+                gcfg.get("karma_img2", ""),
+            ]
+        else:
+            punishment_imgs = self._karma_global_cfg["punishment_imgs"]
+
+        instance = KarmaSystem(
+            punishment_imgs = punishment_imgs,
+            base_prob   = _get("base_prob",  0.15),
+            max_prob    = _get("max_prob",   0.80),
+            up_char     = _get("up_char",    ""),
+            up_prob     = _get("up_prob",    0.10),
+            lock_chars   = _get("lock_chars",   []),
+            up_pool      = _get("up_pool",      []),
+            up_pool_prob = _get("up_pool_prob", 0.05),
+            get_today_fn = get_today,
+        )
+        _karma_cache[gid] = instance
+        return instance
 
     def _init_commands(self):
         """初始化命令映射表"""
@@ -336,8 +418,12 @@ class WifePlugin(Star):
                 save_add_sessions()
             # 过期或无关内容：继续正常分发
 
+        # 需要精确匹配的指令（防止类似「换老婆还没弄好吗」误触发）
+        _EXACT_CMDS = {"换老婆"}
+
         for cmd, func in self.commands.items():
-            if text.startswith(cmd):
+            matched = (text == cmd) if cmd in _EXACT_CMDS else text.startswith(cmd)
+            if matched:
                 event.stop_event()
                 async for res in func(event):
                     yield res
@@ -352,31 +438,72 @@ class WifePlugin(Star):
         nick = event.get_sender_name()
         today = get_today()
 
-        # ── 邓哥曾姐惩罚判定 ──
-        # 条件：今日有人给自己重置换成功过 且 至少配置了一张惩罚图
-        punishment_imgs = [img for img in [self.dengge_img, self.zengjie_img] if img]
-        if punishment_imgs:
-            dengge_rec = records["dengge_resets"].get(gid, {}).get(uid, {})
-            reset_count = dengge_rec.get("count", 0) if dengge_rec.get("date") == today else 0
-            if reset_count > 0:
-                dengge_prob = min(reset_count * self.dengge_base_prob, self.dengge_max_prob)
-                if random.random() < dengge_prob:
-                    prob_pct = int(dengge_prob * 100)
-                    chosen_img = random.choice(punishment_imgs)
-                    is_dengge = (chosen_img == self.dengge_img)
-                    who = "邓哥" if is_dengge else "曾姐"
-                    msg = (
-                        f"{nick}，你今天换老婆次数已经用完，"
-                        f"还重置了 {reset_count} 次（触发概率 {prob_pct}%）——\n"
-                        f"天道好轮回，你抽到的老婆是…… {who}！💍\n"
-                        f"专情才是真理，明天从头开始吧~"
-                    )
-                    img_comp = await self._resolve_wife_image(chosen_img)
-                    if img_comp:
-                        yield event.chain_result([Plain(msg), img_comp])
-                    else:
-                        yield event.plain_result(msg)
-                    return
+        # ── 业力惩罚判定 ──
+        karma = self._get_karma(gid)
+        triggered, karma_img, karma_count = karma.roll_karma(records["karma_resets"], gid, uid)
+        if triggered:
+            prob_pct = karma.calc_prob_pct(karma_count)
+            # 从惩罚图路径提取角色名，如 img2/来源!角色名.jpg → 角色名
+            _karma_char = os.path.splitext(karma_img)[0].split("/")[-1].split("!")[-1] if karma_img else "惩罚角色"
+            msg = (
+                f"{nick}，业力反噬！你今天让人帮你重置了 {karma_count} 次"
+                f"（触发概率 {prob_pct}%），天道好轮回——\n"
+                f"今天的老婆是{_karma_char}！💍\n"
+                f"专情才是真理，明天从头开始吧~"
+            )
+            # 写入群组配置，使「查老婆」能正常显示
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [karma_img, today, nick]
+                save_group_config(gid, cfg)
+            img_comp = await self._resolve_wife_image(karma_img)
+            if img_comp:
+                yield event.chain_result([Plain(msg), img_comp])
+            else:
+                yield event.plain_result(msg)
+            return
+
+        # ── 常驻 UP 池判定 ──
+        pool_img = karma.roll_up_pool()
+        if pool_img:
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [pool_img, today, nick]
+                save_group_config(gid, cfg)
+            _p_char = os.path.splitext(pool_img)[0].split("/")[-1].split("!")[-1] if pool_img else ""
+            _p_src  = os.path.splitext(pool_img)[0].split("/")[-1].split("!")[0]  if "!" in pool_img else ""
+            _p_text = (
+                f"{nick}，[UP] 今天的老婆是来自《{_p_src}》的{_p_char}～"
+                if _p_src else
+                f"{nick}，[UP] 今天的老婆是{_p_char}～"
+            )
+            img_comp = await self._resolve_wife_image(pool_img)
+            if img_comp:
+                yield event.chain_result([Plain(_p_text), img_comp])
+            else:
+                yield event.plain_result(_p_text)
+            return
+
+        # ── 单角色 UP 池判定 ──
+        up_img = karma.roll_up()
+        if up_img:
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [up_img, today, nick]
+                save_group_config(gid, cfg)
+            _up_char = os.path.splitext(up_img)[0].split("/")[-1].split("!")[-1] if up_img else ""
+            _up_src  = os.path.splitext(up_img)[0].split("/")[-1].split("!")[0]  if "!" in up_img else ""
+            _up_text = (
+                f"{nick}，[UP] 今天的老婆是来自《{_up_src}》的{_up_char}～"
+                if _up_src else
+                f"{nick}，[UP] 今天的老婆是{_up_char}～"
+            )
+            img_comp = await self._resolve_wife_image(up_img)
+            if img_comp:
+                yield event.chain_result([Plain(_up_text), img_comp])
+            else:
+                yield event.plain_result(_up_text)
+            return
 
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
@@ -384,7 +511,7 @@ class WifePlugin(Star):
             
             if not wife_data or not isinstance(wife_data, list) or wife_data[1] != today or not self._is_valid_img_path(wife_data[0]):
                 # 今天还没抽，或缓存的是无效路径，重新获取
-                img = await self._fetch_wife_image()
+                img = await self._fetch_wife_image_for_user(gid, uid)
                 if not img:
                     yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
                     return
@@ -415,7 +542,7 @@ class WifePlugin(Star):
                 with open(cache_path, "r", encoding="utf-8") as f:
                     lines = _filter([l.strip() for l in f if l.strip()])
                 if lines:
-                    return random.choice(lines)
+                    return secrets.choice(lines)
         except Exception:
             pass
 
@@ -429,11 +556,76 @@ class WifePlugin(Star):
                             text = await resp.text()
                             lines = _filter([l.strip() for l in text.splitlines() if l.strip()])
                             if lines:
-                                return random.choice(lines)
+                                return secrets.choice(lines)
         except Exception:
             pass
 
         return None
+
+    async def _fetch_wife_image_for_user(self, gid: str, uid: str) -> str | None:
+        """获取老婆图片，排除去重池中已出现的图片。
+
+        逻辑：
+        - 读取全量列表，过滤掉该用户已抽过的图片
+        - 去重池耗尽时自动重置（几千条图几乎不可能耗尽）
+        - 抽到 reset_char 时清空去重池，开始新一轮
+        """
+        img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+        def _filter(lines):
+            return [l for l in lines if "!" in l and l.lower().endswith(img_exts)]
+
+        # 读取全量列表（优先本地缓存）
+        all_lines = []
+        try:
+            cache_path = os.path.join(CONFIG_DIR, "list_cache.txt")
+            if os.path.exists(cache_path):
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    all_lines = _filter([l.strip() for l in f if l.strip()])
+        except Exception:
+            pass
+
+        if not all_lines:
+            try:
+                url = self.image_list_url
+                if url:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                            if resp.status == 200:
+                                text = await resp.text()
+                                all_lines = _filter([l.strip() for l in text.splitlines() if l.strip()])
+            except Exception:
+                pass
+
+        if not all_lines:
+            return None
+
+        # 去重池过滤
+        drawn = set(drawn_pool.get(gid, {}).get(uid, []))
+        available = [l for l in all_lines if l not in drawn]
+
+        # 耗尽时重置（正常情况几千条不会耗尽）
+        if not available:
+            logger.info(f"[去重池] {gid}/{uid} 已抽完全部图片，自动重置")
+            drawn_pool.setdefault(gid, {})[uid] = []
+            save_drawn_pool()
+            available = all_lines
+
+        img = secrets.choice(available)
+
+        # 记录到去重池
+        pool_list = drawn_pool.setdefault(gid, {}).setdefault(uid, [])
+        pool_list.append(img)
+        save_drawn_pool()
+
+        # 抽到 reset_char 时清空去重池，开始新一轮
+        if self.reset_char and img == self.reset_char:
+            logger.info(f"[去重池] {gid}/{uid} 抽到 reset_char，开始新一轮")
+            drawn_pool[gid][uid] = []
+            save_drawn_pool()
+
+        return img
+
 
     async def _build_wife_message(self, img: str, nick: str):
         """构建老婆消息链"""
@@ -593,7 +785,7 @@ class WifePlugin(Star):
             save_records()
             
             # 判断牛老婆是否成功
-            if random.random() < self.ntr_possibility:
+            if _roll(self.ntr_possibility):
                 # 牛成功：目标用户的老婆转给牛者
                 img = cfg[tid][0]
                 cfg[uid] = [img, today, nick]
@@ -646,7 +838,20 @@ class WifePlugin(Star):
         if rec["date"] == today and rec["count"] >= self.change_max_per_day:
             yield event.plain_result(f"{nick}，你今天已经换了{self.change_max_per_day}次老婆啦，明天再来吧~")
             return
-        
+
+        # ── 换老婆锁定检查 ──
+        karma = self._get_karma(gid)
+        if karma.lock_active():
+            cfg_check = load_group_config(gid)
+            if karma.check_locked(cfg_check, uid, today):
+                # 从今天实际抽到的图路径中提取角色名，避免多锁定角色时提示名字错误
+                _actual_img = (cfg_check.get(uid) or [""])[0]
+                char_hint = os.path.splitext(_actual_img)[0].split("/")[-1].split("!")[-1] if _actual_img else "指定角色"
+                yield event.plain_result(
+                    f"{nick}，今天已经抽到了{char_hint}，不准换老婆！好好珍惜吧~"
+                )
+                return
+
         # 检查是否有老婆并删除
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
@@ -712,7 +917,7 @@ class WifePlugin(Star):
         
         tid = self.parse_at_target(event) or uid
         
-        if random.random() < self.reset_success_rate:
+        if _roll(self.reset_success_rate):
             if gid in records["ntr"] and tid in records["ntr"][gid]:
                 del records["ntr"][gid][tid]
                 save_records()
@@ -762,17 +967,11 @@ class WifePlugin(Star):
         
         tid = self.parse_at_target(event) or uid
         
-        if random.random() < self.reset_success_rate:
+        if _roll(self.reset_success_rate):
             grp2 = records["change"].setdefault(gid, {})
             if tid in grp2:
-                # 重置换成功，累计被重置人的邓哥曾姐惩罚次数
-                if self.dengge_img or self.zengjie_img:
-                    dg_grp = records["dengge_resets"].setdefault(gid, {})
-                    dg_rec = dg_grp.get(tid, {"date": today, "count": 0})
-                    if dg_rec.get("date") != today:
-                        dg_rec = {"date": today, "count": 0}
-                    dg_rec["count"] += 1
-                    dg_grp[tid] = dg_rec
+                # 重置换成功，累计被重置人的业力
+                self._get_karma(gid).accumulate(records["karma_resets"], gid, tid)
                 del grp2[tid]
                 save_records()
             yield event.chain_result([
@@ -1807,7 +2006,13 @@ query ($search: String) {
         await self._notify_admin_pending(pid)
 
     async def _handle_img_confirm(self, event: AstrMessageEvent, pid: str, action: str):
-        """处理管理员图片确认：确认/换图/跳过"""
+        """处理管理员图片确认：选N/确认/换图/跳过
+        action 取值：
+          "选:N"  — 用第 N 张图创建 PR
+          "确认"  — 用所有图创建 PR（兼容旧指令）
+          "换图"  — 重新拉图
+          "跳过"  — 创建空 PR
+        """
         import time as _t
         rec = pending_queue.get(pid)
         if not rec:
@@ -1817,13 +2022,32 @@ query ($search: String) {
         src = f"《{rec['source']}》" if rec.get("source") else ""
         img_dir = self._get_img_dir(rec.get("source", ""))
 
-        if action == "确认":
+        if action.startswith("选:") or action == "确认":
             session = admin_img_sessions.pop(pid, None)
             if not session or not session.get("images"):
                 yield event.plain_result("找不到待确认图片，请重新通过审核")
                 return
-            images = session["images"]
-            yield event.plain_result(f"正在用{len(images)}张图创建 PR...")
+            all_images = session["images"]
+
+            # 「选 N」只取第 N 张，「确认」取全部
+            if action.startswith("选:"):
+                try:
+                    idx = int(action.split(":", 1)[1]) - 1  # 转 0-based
+                    if idx < 0 or idx >= len(all_images):
+                        yield event.plain_result(f"编号超出范围，共 {len(all_images)} 张，请选 1~{len(all_images)}")
+                        # 把 session 放回去，让管理员重新选
+                        admin_img_sessions[pid] = session
+                        return
+                    images = [all_images[idx]]
+                    yield event.plain_result(f"已选第 {idx + 1} 张，正在创建 PR...")
+                except ValueError:
+                    yield event.plain_result("格式错误，用法：选 N <pid>，N 为图片编号")
+                    admin_img_sessions[pid] = session
+                    return
+            else:
+                images = all_images
+                yield event.plain_result(f"正在用全部 {len(images)} 张图创建 PR...")
+
             pr_url = await self._create_github_pr(rec["source"], rec["char_name"], img_dir, images)
             if pr_url:
                 rec["status"] = "pr_created"
@@ -1849,23 +2073,30 @@ query ($search: String) {
             }
             platform = rec.get("platform", "default")
             admin_umo = f"{platform}:FriendMessage:{self.admin_qq}"
-            yield event.plain_result(f"新图片（共{len(images)}张）：")
-            for img_bytes in images:
+            await self.context.send_message(
+                admin_umo,
+                MessageChain().message(
+                    f"重新拉到 {len(images)} 张，逐张发送：\n"
+                    f"「选 N {pid}」→ 用第 N 张\n"
+                    f"「换图 {pid}」→ 再换一批\n"
+                    f"「跳过 {pid}」→ 创建空 PR"
+                ),
+            )
+            for i, img_bytes in enumerate(images, 1):
                 try:
-                    tmp = f"/tmp/_shuushuu_admin_{pid}_new_{images.index(img_bytes)}.jpg"
+                    tmp = f"/tmp/_admin_review_{pid}_new_{i}.jpg"
                     with open(tmp, "wb") as f:
                         f.write(img_bytes)
+                    await self.context.send_message(
+                        admin_umo,
+                        MessageChain().message(f"第 {i} 张 / 共 {len(images)} 张："),
+                    )
                     await self.context.send_message(
                         admin_umo,
                         MessageChain([Image.fromFileSystem(tmp)]),
                     )
                 except Exception as e:
-                    logger.warning(f"[审核] 发换图失败: {e}")
-            yield event.plain_result(
-                f"回复「确认 {pid}」→ 用这批图创建 PR\n"
-                f"回复「换图 {pid}」→ 再换一批\n"
-                f"回复「跳过 {pid}」→ 创建空 PR"
-            )
+                    logger.warning(f"[审核] 发换图{i}失败: {e}")
 
         elif action == "跳过":
             admin_img_sessions.pop(pid, None)
@@ -1917,6 +2148,21 @@ query ($search: String) {
             return
 
         msg = event.message_str.strip()
+
+        # ── 选 N：指定用第 N 张图创建 PR ────────────────────────────────────
+        # 格式：选 N <pid>  例：选 2 gid_uid_1234567890
+        if msg.startswith("选 ") or msg.startswith("选"):
+            parts_xuan = msg.split(maxsplit=2)
+            # 必须是 "选 <数字> <pid>" 三段
+            if len(parts_xuan) == 3 and parts_xuan[1].isdigit():
+                target_pid = self._resolve_pid(parts_xuan[2].strip())
+                if not target_pid:
+                    yield event.plain_result(f"找不到记录：{parts_xuan[2].strip()}")
+                    return
+                action = f"选:{parts_xuan[1]}"
+                async for res in self._handle_img_confirm(event, target_pid, action):
+                    yield res
+                return
 
         # ── 图片确认：确认/换图/跳过 ────────────────────────────────────────
         for cmd in ("确认", "换图", "跳过"):
@@ -2050,17 +2296,17 @@ query ($search: String) {
             "expire_time": _t.time() + 300,
         }
 
-        # 私聊发图
+        # 私聊发图：逐张带编号，管理员可回「选 N」指定用哪张
         platform = rec.get("platform", "default")
         admin_umo = f"{platform}:FriendMessage:{self.admin_qq}"
         try:
             await self.context.send_message(
                 admin_umo,
                 MessageChain().message(
-                    f"「{src}{rec['char_name']}」候选图片（共{len(images)}张），请确认：\n"
-                    f"回复「确认 {pid}」→ 用这批图创建 PR\n"
-                    f"回复「换图 {pid}」→ 重新拉一批\n"
-                    f"回复「跳过 {pid}」→ 创建空 PR（手动传图）"
+                    f"「{src}{rec['char_name']}」找到 {len(images)} 张候选图，逐张发送，看好后回复：\n"
+                    f"「选 N {pid}」→ 用第 N 张创建 PR（如：选 2 {pid}）\n"
+                    f"「换图 {pid}」→ 重新拉一批\n"
+                    f"「跳过 {pid}」→ 创建空 PR（手动传图）"
                 ),
             )
             for i, img_bytes in enumerate(images, 1):
@@ -2068,6 +2314,11 @@ query ($search: String) {
                     tmp = f"/tmp/_admin_review_{pid}_{i}.jpg"
                     with open(tmp, "wb") as f:
                         f.write(img_bytes)
+                    # 先发编号文字，再发图
+                    await self.context.send_message(
+                        admin_umo,
+                        MessageChain().message(f"第 {i} 张 / 共 {len(images)} 张："),
+                    )
                     await self.context.send_message(
                         admin_umo,
                         MessageChain([Image.fromFileSystem(tmp)]),
@@ -2076,7 +2327,7 @@ query ($search: String) {
                     logger.warning(f"[审核] 发图{i}失败: {e}")
         except Exception as e:
             logger.error(f"[审核] 私聊发图失败: {e}")
-            yield event.plain_result(f"私聊发图失败（{e}），回复「确认 {pid}」/「换图 {pid}」/「跳过 {pid}」继续")
+            yield event.plain_result(f"私聊发图失败（{e}），回复「选 N {pid}」/「换图 {pid}」/「跳过 {pid}」继续")
 
     async def pr_online(self, event: AstrMessageEvent):
         """管理员命令：pr上线 pid —— merge后艾特提交者通知审核通过上线"""
@@ -2172,14 +2423,27 @@ query ($search: String) {
                 images.extend(await self._pixiv_fetch(q, count - len(images)))
             logger.info("[添老婆] Pixiv 后共%d张" % len(images))
 
-        # 2. e-shuushuu（有 token 时）
+        # 2. 自定义图源（extra_image_sources 配置，Pixiv 之后、booru 之前）
+        extra_sources_raw = self.config.get("extra_image_sources", "")
+        extra_sources = [s.strip() for s in extra_sources_raw.split(",") if s.strip()]
+        if extra_sources and len(images) < count:
+            for src_name in extra_sources:
+                if len(images) >= count:
+                    break
+                for q in pixiv_tags:
+                    if len(images) >= count:
+                        break
+                    images.extend(await self._custom_source_fetch(src_name, q, count - len(images)))
+            logger.info("[添老婆] 自定义图源(%s)后共%d张" % (",".join(extra_sources), len(images)))
+
+        # 3. e-shuushuu（有 token 时）
         if len(images) < count and self.config.get("shuushuu_access_token"):
             images.extend(await self._shuushuu_fetch(
                 char_name, en_name, kana_name, source, count - len(images)
             ))
             logger.info("[添老婆] shuushuu 后共%d张" % len(images))
 
-        # 3. Gelbooru（rating:general 过滤 R18）
+        # 4. Gelbooru（rating:general 过滤 R18）
         if len(images) < count:
             for q in booru_tags:
                 if len(images) >= count:
@@ -2221,7 +2485,7 @@ query ($search: String) {
                     logger.info("[添老婆] Getchu 后共%d张" % len(images))
                     break
 
-        # 7. DLsite 封面（终极最后保底）
+        # 8. DLsite 封面（终极最后保底）
         if not images:
             logger.info("[添老婆] Getchu 也失败，尝试 DLsite 封面保底")
             for q in source_queries:
@@ -2734,6 +2998,77 @@ query ($search: String) {
         return images
 
 
+    async def _custom_source_fetch(self, source_name: str, query: str, count: int) -> list[bytes]:
+        """自定义图源分发入口。source_name 为 extra_image_sources 中配置的图源名（小写）。
+        新增图源时在此处加一个 elif 分支即可。
+        """
+        source_name = source_name.strip().lower()
+
+        if source_name == "lolicon":
+            return await self._lolicon_fetch(query, count)
+
+        # ── 待扩展图源 ──────────────────────────────────────────────────────
+        # elif source_name == "zerochan":
+        #     return await self._zerochan_fetch(query, count)
+        # elif source_name == "animepictures":
+        #     return await self._animepictures_fetch(query, count)
+        # ────────────────────────────────────────────────────────────────────
+
+        else:
+            logger.warning("[添老婆][自定义图源] 未知图源名: %r，跳过" % source_name)
+            return []
+
+    async def _lolicon_fetch(self, query: str, count: int) -> list[bytes]:
+        """lolicon API 拉图（api.lolicon.app），rating=0 仅全年龄，按关键词搜索。
+        API 文档：https://api.lolicon.app/#/setu
+        """
+        images = []
+        try:
+            params = {
+                "keyword": query,
+                "r18": 0,           # 0 = 仅全年龄
+                "num": min(count * 2, 20),
+                "size": ["original", "regular"],
+            }
+            async with aiohttp.ClientSession() as s:
+                async with s.post(
+                    "https://api.lolicon.app/setu/v2",
+                    json=params,
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as r:
+                    if r.status != 200:
+                        logger.warning("[添老婆][lolicon] HTTP %d query=%r" % (r.status, query))
+                        return []
+                    data = await r.json()
+
+            items = data.get("data") or []
+            logger.info("[添老婆][lolicon] query=%r 返回%d条" % (query, len(items)))
+
+            async with aiohttp.ClientSession() as s:
+                for item in items:
+                    if len(images) >= count:
+                        break
+                    urls = item.get("urls") or {}
+                    url = urls.get("original") or urls.get("regular")
+                    if not url:
+                        continue
+                    try:
+                        async with s.get(
+                            url,
+                            headers={"Referer": "https://www.pixiv.net/"},
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as r:
+                            if r.status == 200:
+                                img_data = await r.read()
+                                if len(img_data) > 10 * 1024:
+                                    images.append(img_data)
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.error("[添老婆] lolicon 拉图失败: %s" % e)
+        return images
+
     async def _pixiv_fetch(self, query: str, count: int) -> list[bytes]:
         """Pixiv 搜索角色图片（全年龄）"""
         images = []
@@ -2754,8 +3089,9 @@ query ($search: String) {
             posts = result.illusts or []
             # 只取全年龄
             posts = [p for p in posts if getattr(p, "x_restrict", 1) == 0]
-            random.shuffle(posts)
-            logger.info("[添老婆][Pixiv] query=%r 返回%d条(全年龄)" % (query, len(posts)))
+            # 按收藏数降序，优先取人气高的图
+            posts.sort(key=lambda p: getattr(p, "total_bookmarks", 0), reverse=True)
+            logger.info("[添老婆][Pixiv] query=%r 返回%d条(全年龄，按收藏数排序)" % (query, len(posts)))
 
             async with aiohttp.ClientSession() as s:
                 for post in posts:
@@ -3159,3 +3495,5 @@ query ($search: String) {
         ntr_statuses.clear()
         add_sessions.clear()
         pending_queue.clear()
+        drawn_pool.clear()
+        _karma_cache.clear()

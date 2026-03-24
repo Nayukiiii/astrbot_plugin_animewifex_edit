@@ -136,5 +136,65 @@
         "type": "string",
         "default": "",
         "hint": "登录 e-shuushuu.net 后从浏览器 Cookie 中获取 refresh_token 的值"
+    },
+    "extra_image_sources": {
+        "description": "自定义额外图源",
+        "type": "string",
+        "default": "",
+        "hint": "启用的额外图源，逗号分隔，如 lolicon,zerochan。拉图优先级：Pixiv → 此处 → Gelbooru 等 booru 站。目前支持的图源名：lolicon"
+    },
+    "karma_img1": {
+        "description": "业力惩罚图1路径（全局默认）",
+        "type": "string",
+        "default": "",
+        "hint": "list.txt 中的相对路径，如 来源!角色名.jpg。留空则不启用。各群可在 karma_groups.json 中单独覆盖"
+    },
+    "karma_img2": {
+        "description": "业力惩罚图2路径（全局默认）",
+        "type": "string",
+        "default": "",
+        "hint": "list.txt 中的相对路径。与惩罚图1随机选一张发出。留空则不启用"
+    },
+    "karma_base_prob": {
+        "description": "业力惩罚每点增加概率（全局默认）",
+        "type": "float",
+        "default": 0.15,
+        "hint": "每次被重置换成功后，下次抽老婆触发惩罚的概率增加量。取值范围 [0, 1]"
+    },
+    "karma_max_prob": {
+        "description": "业力惩罚概率上限（全局默认）",
+        "type": "float",
+        "default": 0.8,
+        "hint": "业力惩罚触发概率的最高值。取值范围 [0, 1]"
+    },
+    "up_char": {
+        "description": "UP 池角色图片路径（全局默认）",
+        "type": "string",
+        "default": "",
+        "hint": "list.txt 中的相对路径，抽老婆时有 up_prob 概率强制抽到此角色。留空则不启用。各群可在 karma_groups.json 中单独覆盖"
+    },
+    "up_prob": {
+        "description": "UP 池触发概率（全局默认）",
+        "type": "float",
+        "default": 0.1,
+        "hint": "抽老婆时强制出现 UP 角色的概率。取值范围 [0, 1]"
+    },
+    "lock_char": {
+        "description": "换老婆锁定角色图片路径（全局默认）",
+        "type": "string",
+        "default": "",
+        "hint": "list.txt 中的相对路径，当天抽到此角色后禁止换老婆。多个角色用英文逗号分隔，抽到任意一个均触发锁定。留空则不启用"
+    },
+    "reset_char": {
+        "description": "去重池重置角色图片路径（全局）",
+        "type": "string",
+        "default": "",
+        "hint": "list.txt 中的相对路径，抽到此角色后清空该用户去重池，开始新一轮。留空则不启用"
+    },
+    "up_pool_prob": {
+        "description": "常驻 UP 池触发概率（全局默认）",
+        "type": "float",
+        "default": 0.05,
+        "hint": "每次抽老婆时从常驻 UP 池出货的概率。取值范围 [0, 1]。各群可在 karma_groups.json 中单独覆盖"
     }
 }
