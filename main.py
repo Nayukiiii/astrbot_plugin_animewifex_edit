@@ -13,6 +13,12 @@ import re
 from urllib.parse import quote
 from .hentai_search import HentaiSearcher
 from .karma import KarmaSystem, _roll
+from .services.character_resolver import CharacterResolver
+from .services.github_publisher import GitHubPublisher
+from .services.image_fetcher import ImageFetcher
+from .services.retention import RetentionService
+from .services.review import ReviewStatus
+from .services.translation import TranslationCache
 
 # ==================== 常量定义 ====================
 
@@ -31,7 +37,6 @@ NTR_STATUS_FILE = os.path.join(CONFIG_DIR, "ntr_status.json")
 ADD_SESSIONS_FILE = os.path.join(CONFIG_DIR, "add_sessions.json")
 PENDING_FILE = os.path.join(CONFIG_DIR, "pending.json")
 EN_CACHE_FILE    = os.path.join(CONFIG_DIR, "en_cache.json")    # 角色名→英文名缓存
-DRAWN_POOL_FILE  = os.path.join(CONFIG_DIR, "drawn_pool.json")   # 去重池
 KARMA_GROUPS_FILE = os.path.join(CONFIG_DIR, "karma_groups.json") # 分群业力配置
 
 # ==================== 全局数据存储 ====================
@@ -41,9 +46,15 @@ records = {  # 统一的记录数据结构
     "change": {},     # 换老婆记录
     "reset": {},      # 重置使用次数
     "swap": {},       # 交换老婆请求次数
-    "karma_resets": {}  # 每日重置换成功次数（用于业力系统）
+    "karma_resets": {},  # 每日重置换成功次数（用于业力系统）
+    "draw_stats": {}  # 抽老婆留存统计 {gid: {uid: {last_date, streak, total_draws}}}
 }
-drawn_pool   = {}   # 去重池 {gid: {uid: [img, ...]}}
+drawn_pool      = {}   # 去重池 {gid: {uid: [img, ...]}}
+_list_cache_mem: list[str] = []  # list_cache.txt 内存缓存，避免每次抽老婆读盘
+DRAWN_POOL_MAX  = 500  # 每人最多保留最近N条，超出滚动丢弃
+DRAWN_POOL_FILE = os.path.join(CONFIG_DIR, "drawn_pool.json")  # 持久化文件
+ADD_SESSION_TTL = 180  # 添老婆交互有效期，群聊里给手机用户多一点反应时间
+_drawn_pool_dirty = False  # 脏标记，有变更才写盘
 _karma_cache = {}   # 每群 KarmaSystem 实例缓存 {gid: KarmaSystem}
 swap_requests = {}  # 交换请求数据
 ntr_statuses = {}   # NTR 开关状态
@@ -137,31 +148,46 @@ def save_pending():
     """保存待审核队列"""
     save_json(PENDING_FILE, pending_queue)
 
-
 def load_drawn_pool():
-    """加载去重池"""
+    """加载去重池，每人截断到最近 DRAWN_POOL_MAX 条"""
     raw = load_json(DRAWN_POOL_FILE)
     drawn_pool.clear()
-    drawn_pool.update(raw)
-
+    for gid, users in raw.items():
+        drawn_pool[gid] = {
+            uid: lst[-DRAWN_POOL_MAX:] for uid, lst in users.items() if lst
+        }
 
 def save_drawn_pool():
-    """保存去重池"""
+    """保存去重池到文件"""
+    global _drawn_pool_dirty
     save_json(DRAWN_POOL_FILE, drawn_pool)
+    _drawn_pool_dirty = False
+
+
 
 
 # ==================== 数据加载和保存函数 ====================
 
 def load_records():
-    """加载所有记录数据"""
+    """加载所有记录数据，清理非今日的旧记录防止无限堆积"""
     raw = load_json(RECORDS_FILE)
+    today = get_today()
+
+    def _clean(d: dict) -> dict:
+        """只保留今日记录"""
+        return {
+            gid: {uid: rec for uid, rec in users.items() if rec.get("date") == today}
+            for gid, users in d.items()
+        }
+
     records.clear()
     records.update({
-        "ntr": raw.get("ntr", {}),
-        "change": raw.get("change", {}),
-        "reset": raw.get("reset", {}),
-        "swap": raw.get("swap", {}),
-        "karma_resets": raw.get("karma_resets", {})
+        "ntr":          _clean(raw.get("ntr", {})),
+        "change":       _clean(raw.get("change", {})),
+        "reset":        _clean(raw.get("reset", {})),
+        "swap":         _clean(raw.get("swap", {})),
+        "karma_resets": _clean(raw.get("karma_resets", {})),
+        "draw_stats":   raw.get("draw_stats", {}),
     })
 
 
@@ -219,11 +245,37 @@ class WifePlugin(Star):
         self._init_config()
         self._init_commands()
         self.admins = self.load_admins()
-        self._hentai_searcher = HentaiSearcher(self.config, en_cache_fn=self._get_en_name_from_cache)
+        self.translation_cache = TranslationCache(EN_CACHE_FILE)
+        self.character_resolver = CharacterResolver()
+        self._hentai_searcher = HentaiSearcher(
+            self.config,
+            en_cache_fn=self._get_en_name_from_cache,
+            en_cache_write_fn=self._write_en_name_cache_sync,
+            trans_cache_fn=self._get_translation_from_cache,
+            trans_cache_write_fn=self._write_translation_cache_sync,
+        )
+        self.image_fetcher = ImageFetcher(self.config, translate_fn=self._ai_translate_multi)
+        self.github_publisher = GitHubPublisher(
+            self.config,
+            list_cache_path=os.path.join(CONFIG_DIR, "list_cache.txt"),
+            translation_profile_fn=self._get_translation_from_cache,
+        )
+        self.retention = RetentionService(
+            records,
+            drawn_pool,
+            list_cache_size_fn=self._list_cache_size,
+            save_records_fn=save_records,
+            get_today_fn=get_today,
+            change_limit=self.change_max_per_day,
+            ntr_limit=self.ntr_max,
+            swap_limit=self.swap_max_per_day,
+        )
         # 启动时异步拉取 list 缓存
         asyncio.create_task(self._refresh_list_cache())
         # 启动时后台静默补全英文名缓存（限速慢跑，不影响正常使用）
         asyncio.create_task(self._bg_fill_en_cache())
+        # 定时写盘：每5分钟把去重池脏数据写入文件
+        asyncio.create_task(self._bg_flush_drawn_pool())
 
     def _init_config(self):
         """初始化配置参数"""
@@ -252,7 +304,7 @@ class WifePlugin(Star):
             ],
             "base_prob" : self.config.get("karma_base_prob", 0.15),
             "max_prob"  : self.config.get("karma_max_prob", 0.80),
-            "up_char"   : self.config.get("up_char", ""),
+            "up_chars"  : [s.strip() for s in self.config.get("up_chars", "").split(",") if s.strip()],
             "up_prob"   : self.config.get("up_prob", 0.10),
             "lock_chars"  : [s.strip() for s in self.config.get("lock_char", "").split(",") if s.strip()],
             "up_pool"       : [],
@@ -276,7 +328,7 @@ class WifePlugin(Star):
                 "karma_img2": "来源!角色.jpg",
                 "base_prob": 0.15,
                 "max_prob": 0.80,
-                "up_char": "",
+                "up_chars": [],
                 "up_prob": 0.10,
                 "lock_chars": []
             }
@@ -303,7 +355,7 @@ class WifePlugin(Star):
             punishment_imgs = punishment_imgs,
             base_prob   = _get("base_prob",  0.15),
             max_prob    = _get("max_prob",   0.80),
-            up_char     = _get("up_char",    ""),
+            up_chars    = _get("up_chars",   []),
             up_prob     = _get("up_prob",    0.10),
             lock_chars   = _get("lock_chars",   []),
             up_pool      = _get("up_pool",      []),
@@ -319,6 +371,12 @@ class WifePlugin(Star):
             "老婆帮助": self.wife_help,
             "抽老婆": self.animewife,
             "查老婆": self.search_wife,
+            "老婆图鉴": self.wife_album,
+            "我的图鉴": self.wife_album,
+            "今日老婆榜": self.today_wife_board,
+            "连续抽老婆排行": self.draw_streak_rank,
+            "老婆排行": self.draw_streak_rank,
+            "图鉴排行": self.album_rank,
             "牛老婆": self.ntr_wife,
             "重置牛": self.reset_ntr,
             "切换ntr开关状态": self.switch_ntr,
@@ -330,8 +388,11 @@ class WifePlugin(Star):
             "查看交换请求": self.view_swap_requests,
             "要本子": self.get_hentai,
             "添老婆": self.add_wife,
+            "我的老婆申请": self.my_wife_submissions,
             "补充来源": self.add_wife_source,
             "刷新缓存": self.rebuild_en_cache,
+            "解析角色": self.inspect_translation,
+            "重译角色": self.retranslate_character,
             "pr上线": self.pr_online,
         }
 
@@ -417,6 +478,15 @@ class WifePlugin(Star):
                 add_sessions.get(gid, {}).pop(uid, None)
                 save_add_sessions()
             # 过期或无关内容：继续正常分发
+        if session and session.get("step") == "waiting_manual_source":
+            import time as _t
+            if session.get("expire_time", 0) > _t.time():
+                event.stop_event()
+                async for res in self.add_wife(event):
+                    yield res
+                return
+            add_sessions.get(gid, {}).pop(uid, None)
+            save_add_sessions()
 
         # 需要精确匹配的指令（防止类似「换老婆还没弄好吗」误触发）
         _EXACT_CMDS = {"换老婆"}
@@ -438,6 +508,15 @@ class WifePlugin(Star):
         nick = event.get_sender_name()
         today = get_today()
 
+        # ── 今天已抽过：直接返回当天结果，不重复判定 ──
+        async with get_config_lock(gid):
+            _cfg_today = load_group_config(gid)
+            _wd_today  = _cfg_today.get(uid)
+            if isinstance(_wd_today, list) and len(_wd_today) >= 2 and _wd_today[1] == today and self._is_valid_img_path(_wd_today[0]):
+                self._record_daily_draw(gid, uid, today)
+                yield event.chain_result(await self._build_wife_message(_wd_today[0], nick, gid=gid, uid=uid))
+                return
+
         # ── 业力惩罚判定 ──
         karma = self._get_karma(gid)
         triggered, karma_img, karma_count = karma.roll_karma(records["karma_resets"], gid, uid)
@@ -454,8 +533,10 @@ class WifePlugin(Star):
             # 写入群组配置，使「查老婆」能正常显示
             async with get_config_lock(gid):
                 cfg = load_group_config(gid)
-                cfg[uid] = [karma_img, today, nick]
+                cfg[uid] = [karma_img, today, nick, "karma_locked"]
                 save_group_config(gid, cfg)
+            self._record_daily_draw(gid, uid, today)
+            msg += self._retention_hint(gid, uid)
             img_comp = await self._resolve_wife_image(karma_img)
             if img_comp:
                 yield event.chain_result([Plain(msg), img_comp])
@@ -470,6 +551,7 @@ class WifePlugin(Star):
                 cfg = load_group_config(gid)
                 cfg[uid] = [pool_img, today, nick]
                 save_group_config(gid, cfg)
+            self._record_daily_draw(gid, uid, today)
             _p_char = os.path.splitext(pool_img)[0].split("/")[-1].split("!")[-1] if pool_img else ""
             _p_src  = os.path.splitext(pool_img)[0].split("/")[-1].split("!")[0]  if "!" in pool_img else ""
             _p_text = (
@@ -477,6 +559,7 @@ class WifePlugin(Star):
                 if _p_src else
                 f"{nick}，[UP] 今天的老婆是{_p_char}～"
             )
+            _p_text += self._retention_hint(gid, uid)
             img_comp = await self._resolve_wife_image(pool_img)
             if img_comp:
                 yield event.chain_result([Plain(_p_text), img_comp])
@@ -491,6 +574,7 @@ class WifePlugin(Star):
                 cfg = load_group_config(gid)
                 cfg[uid] = [up_img, today, nick]
                 save_group_config(gid, cfg)
+            self._record_daily_draw(gid, uid, today)
             _up_char = os.path.splitext(up_img)[0].split("/")[-1].split("!")[-1] if up_img else ""
             _up_src  = os.path.splitext(up_img)[0].split("/")[-1].split("!")[0]  if "!" in up_img else ""
             _up_text = (
@@ -498,6 +582,7 @@ class WifePlugin(Star):
                 if _up_src else
                 f"{nick}，[UP] 今天的老婆是{_up_char}～"
             )
+            _up_text += self._retention_hint(gid, uid)
             img_comp = await self._resolve_wife_image(up_img)
             if img_comp:
                 yield event.chain_result([Plain(_up_text), img_comp])
@@ -505,23 +590,30 @@ class WifePlugin(Star):
                 yield event.plain_result(_up_text)
             return
 
+        # 先在锁外判断是否需要重新抽取
+        img = None
+        need_fetch = False
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
             wife_data = cfg.get(uid)
-            
             if not wife_data or not isinstance(wife_data, list) or wife_data[1] != today or not self._is_valid_img_path(wife_data[0]):
-                # 今天还没抽，或缓存的是无效路径，重新获取
-                img = await self._fetch_wife_image_for_user(gid, uid)
-                if not img:
-                    yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
-                    return
-                cfg[uid] = [img, today, nick]
-                save_group_config(gid, cfg)
+                need_fetch = True
             else:
                 img = wife_data[0]
-        
+
+        if need_fetch:
+            img = await self._fetch_wife_image_for_user(gid, uid)
+            if not img:
+                yield event.plain_result("抱歉，今天的老婆获取失败了，请稍后再试~")
+                return
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [img, today, nick]
+                save_group_config(gid, cfg)
+            self._record_daily_draw(gid, uid, today)
+
         # 生成并发送消息
-        yield event.chain_result(await self._build_wife_message(img, nick))
+        yield event.chain_result(await self._build_wife_message(img, nick, gid=gid, uid=uid))
 
     def _is_valid_img_path(self, img: str) -> bool:
         """校验图片路径是否合法（必须含!且有图片扩展名）"""
@@ -566,8 +658,8 @@ class WifePlugin(Star):
         """获取老婆图片，排除去重池中已出现的图片。
 
         逻辑：
-        - 读取全量列表，过滤掉该用户已抽过的图片
-        - 去重池耗尽时自动重置（几千条图几乎不可能耗尽）
+        - 优先读内存缓存 _list_cache_mem，避免每次读盘
+        - 去重池耗尽时自动重置
         - 抽到 reset_char 时清空去重池，开始新一轮
         """
         img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp")
@@ -575,15 +667,18 @@ class WifePlugin(Star):
         def _filter(lines):
             return [l for l in lines if "!" in l and l.lower().endswith(img_exts)]
 
-        # 读取全量列表（优先本地缓存）
-        all_lines = []
-        try:
-            cache_path = os.path.join(CONFIG_DIR, "list_cache.txt")
-            if os.path.exists(cache_path):
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    all_lines = _filter([l.strip() for l in f if l.strip()])
-        except Exception:
-            pass
+        # 优先用内存缓存，避免每次抽老婆读盘
+        all_lines = list(_list_cache_mem) if _list_cache_mem else []
+
+        if not all_lines:
+            # 内存缓存为空（首次启动未拉取），回落到读本地文件
+            try:
+                cache_path = os.path.join(CONFIG_DIR, "list_cache.txt")
+                if os.path.exists(cache_path):
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        all_lines = _filter([l.strip() for l in f if l.strip()])
+            except Exception:
+                pass
 
         if not all_lines:
             try:
@@ -608,34 +703,70 @@ class WifePlugin(Star):
         if not available:
             logger.info(f"[去重池] {gid}/{uid} 已抽完全部图片，自动重置")
             drawn_pool.setdefault(gid, {})[uid] = []
-            save_drawn_pool()
             available = all_lines
 
         img = secrets.choice(available)
 
-        # 记录到去重池
+        # 记录到去重池（超出 DRAWN_POOL_MAX 时滚动丢弃最旧的）
+        global _drawn_pool_dirty
         pool_list = drawn_pool.setdefault(gid, {}).setdefault(uid, [])
         pool_list.append(img)
-        save_drawn_pool()
+        if len(pool_list) > DRAWN_POOL_MAX:
+            drawn_pool[gid][uid] = pool_list[-DRAWN_POOL_MAX:]
+        _drawn_pool_dirty = True
 
         # 抽到 reset_char 时清空去重池，开始新一轮
         if self.reset_char and img == self.reset_char:
             logger.info(f"[去重池] {gid}/{uid} 抽到 reset_char，开始新一轮")
             drawn_pool[gid][uid] = []
-            save_drawn_pool()
 
         return img
 
 
-    async def _build_wife_message(self, img: str, nick: str):
+    def _record_daily_draw(self, gid: str, uid: str, today: str) -> dict:
+        """记录用户每日首次抽取，用于连续天数和累计抽取展示。"""
+        return self.retention.record_daily_draw(gid, uid, today)
+
+    def _get_draw_stats(self, gid: str, uid: str) -> dict:
+        return self.retention.get_draw_stats(gid, uid)
+
+    def _list_cache_size(self) -> int:
+        if _list_cache_mem:
+            return len(_list_cache_mem)
+        try:
+            cache_path = os.path.join(CONFIG_DIR, "list_cache.txt")
+            if os.path.exists(cache_path):
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return sum(
+                        1 for line in f
+                        if line.strip() and "!" in line and line.strip().lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp"))
+                    )
+        except Exception:
+            pass
+        return 0
+
+    def _album_summary(self, gid: str, uid: str) -> tuple[int, int, int]:
+        return self.retention.album_summary(gid, uid)
+
+    def _remaining_daily_count(self, bucket: str, gid: str, uid: str, limit: int, today: str) -> int:
+        return self.retention.remaining_daily_count(bucket, gid, uid, limit, today)
+
+    def _retention_hint(self, gid: str, uid: str) -> str:
+        return self.retention.retention_hint(gid, uid)
+
+    async def _build_wife_message(self, img: str, nick: str, gid: str | None = None, uid: str | None = None):
         """构建老婆消息链"""
         name = os.path.splitext(img)[0].split("/")[-1]
         
         if "!" in name:
             source, chara = name.split("!", 1)
-            text = f"{nick}，你今天的老婆是来自《{source}》的{chara}，请好好珍惜哦~\n发送「要本子」看看有没有她的本子~"
+            text = f"{nick}，你今天的老婆是来自《{source}》的{chara}，请好好珍惜哦~"
         else:
-            text = f"{nick}，你今天的老婆是{name}，请好好珍惜哦~\n发送「要本子」看看有没有她的本子~"
+            text = f"{nick}，你今天的老婆是{name}，请好好珍惜哦~"
+        if gid and uid:
+            text += self._retention_hint(gid, uid)
+        else:
+            text += "\n发送「要本子」看看有没有她的本子~"
         
         img_comp = await self._resolve_wife_image(img)
         if img_comp:
@@ -684,6 +815,10 @@ class WifePlugin(Star):
 【基础命令】
 • 抽老婆 - 每天抽取一个二次元老婆
 • 查老婆 [@用户] - 查看别人的老婆
+• 老婆图鉴 - 查看自己的连续天数和图鉴进度
+• 今日老婆榜 - 查看本群今天已抽到的老婆
+• 老婆排行 - 查看连续抽老婆排行
+• 图鉴排行 - 查看本群图鉴进度排行
 • 要本子 - AI识别老婆角色及作品，搜索18Comic对应内容
 
 【牛老婆功能】(概率较低😭)
@@ -700,12 +835,91 @@ class WifePlugin(Star):
 • 拒绝交换 [@发起者] - 拒绝交换请求
 • 查看交换请求 - 查看当前的交换请求
 
+【共建老婆库】
+• 添老婆 角色名/作品名 - 搜索并提交新角色
+• 我的老婆申请 - 查看自己提交的审核进度
+• 解析角色 角色名/作品名 - 查看翻译档案与搜索用别名
+
 【管理员命令】
 • 切换ntr开关状态 - 开启/关闭NTR功能
+• 重译角色 角色名/作品名 - 清除缓存并重新解析角色
 
 💡 提示：部分命令有每日使用次数限制
 """
         yield event.plain_result(help_text.strip())
+
+    async def wife_album(self, event: AstrMessageEvent):
+        """查看自己的图鉴与连续抽取进度"""
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        stats = self._get_draw_stats(gid, uid)
+        seen, total, pct = self._album_summary(gid, uid)
+        last_date = stats.get("last_date") or "还没有记录"
+        lines = [
+            f"{nick} 的老婆图鉴",
+            f"已见角色：{seen}/{total}（{pct}%）" if total else f"已见角色：{seen}",
+            f"连续抽取：{int(stats.get('streak', 0) or 0)} 天",
+            f"累计抽取：{int(stats.get('total_draws', 0) or 0)} 天",
+            f"最近抽取：{last_date}",
+            "",
+            "今日入口：抽老婆 / 换老婆 / 交换老婆 @群友 / 添老婆 角色名/作品名",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    def _wife_display_name(self, img: str) -> str:
+        return self.retention.wife_display_name(img)
+
+    async def today_wife_board(self, event: AstrMessageEvent):
+        """查看本群今日老婆榜"""
+        gid = str(event.message_obj.group_id)
+        today = get_today()
+        cfg = load_group_config(gid)
+        rows = self.retention.today_wife_rows(cfg, today)
+
+        if not rows:
+            yield event.plain_result("今天还没人抽老婆。发「抽老婆」拿下本群第一抽吧~")
+            return
+
+        random.shuffle(rows)
+        lines = [f"今日老婆榜（{len(rows)} 人已抽）"]
+        for i, (nick, wife_name) in enumerate(rows[:15], 1):
+            lines.append(f"{i}. {nick}：{wife_name}")
+        if len(rows) > 15:
+            lines.append(f"...还有 {len(rows) - 15} 人")
+        yield event.plain_result("\n".join(lines))
+
+    async def draw_streak_rank(self, event: AstrMessageEvent):
+        """查看本群连续抽老婆排行"""
+        gid = str(event.message_obj.group_id)
+        cfg = load_group_config(gid)
+        rows = self.retention.draw_streak_rank_rows(gid, cfg, limit=10)
+
+        if not rows:
+            yield event.plain_result("本群还没有连续抽取记录。今天开始养榜吧，发「抽老婆」就行~")
+            return
+
+        lines = ["连续抽老婆排行"]
+        for i, (streak, total, nick) in enumerate(rows, 1):
+            lines.append(f"{i}. {nick}：连续 {streak} 天，累计 {total} 天")
+        yield event.plain_result("\n".join(lines))
+
+    async def album_rank(self, event: AstrMessageEvent):
+        """查看本群图鉴进度排行"""
+        gid = str(event.message_obj.group_id)
+        cfg = load_group_config(gid)
+        rows, total = self.retention.album_rank_rows(gid, cfg, limit=10)
+
+        if not rows:
+            yield event.plain_result("本群还没有图鉴记录。发「抽老婆」开图鉴吧~")
+            return
+
+        title = f"图鉴排行（总池 {total} 位）" if total else "图鉴排行"
+        lines = [title]
+        for i, (seen, pct, nick) in enumerate(rows, 1):
+            suffix = f"（{pct}%）" if total else ""
+            lines.append(f"{i}. {nick}：已见 {seen} 位{suffix}")
+        yield event.plain_result("\n".join(lines))
 
     async def search_wife(self, event: AstrMessageEvent):
         """查老婆"""
@@ -720,7 +934,7 @@ class WifePlugin(Star):
             yield event.plain_result("没有发现老婆的踪迹，快去抽一个试试吧~")
             return
         
-        img, _, owner = wife_data
+        img, _, owner = wife_data[0], wife_data[1], wife_data[2]
         
         name = os.path.splitext(img)[0].split("/")[-1]
         
@@ -777,6 +991,11 @@ class WifePlugin(Star):
             cfg = load_group_config(gid)
             if tid not in cfg or cfg[tid][1] != today:
                 yield event.plain_result("对方今天还没有老婆可牛哦~")
+                return
+            # 业力锁：目标受业力庇护，无法被牛
+            if len(cfg[tid]) > 3 and cfg[tid][3] == "karma_locked":
+                _t_name = cfg[tid][2] if len(cfg[tid]) > 2 else "对方"
+                yield event.plain_result(f"{_t_name} 的老婆受业力庇护，今天牛不走！")
                 return
             
             # 更新牛的次数
@@ -839,13 +1058,19 @@ class WifePlugin(Star):
             yield event.plain_result(f"{nick}，你今天已经换了{self.change_max_per_day}次老婆啦，明天再来吧~")
             return
 
-        # ── 换老婆锁定检查 ──
+        # ── 业力锁 & 换老婆锁定检查（共用一次读取）──
+        _cfg_lock = load_group_config(gid)
+        _wd_karma = _cfg_lock.get(uid)
+        if isinstance(_wd_karma, list) and len(_wd_karma) > 3 and _wd_karma[3] == "karma_locked" and _wd_karma[1] == today:
+            _karma_char2 = os.path.splitext(_wd_karma[0])[0].split("/")[-1].split("!")[-1] if _wd_karma[0] else "她"
+            yield event.plain_result(f"{nick}，业力缠身，今天就安心陪着{_karma_char2}吧，明天再说~")
+            return
+
         karma = self._get_karma(gid)
         if karma.lock_active():
-            cfg_check = load_group_config(gid)
-            if karma.check_locked(cfg_check, uid, today):
+            if karma.check_locked(_cfg_lock, uid, today):
                 # 从今天实际抽到的图路径中提取角色名，避免多锁定角色时提示名字错误
-                _actual_img = (cfg_check.get(uid) or [""])[0]
+                _actual_img = (_cfg_lock.get(uid) or [""])[0]
                 char_hint = os.path.splitext(_actual_img)[0].split("/")[-1].split("!")[-1] if _actual_img else "指定角色"
                 yield event.plain_result(
                     f"{nick}，今天已经抽到了{char_hint}，不准换老婆！好好珍惜吧~"
@@ -1037,6 +1262,7 @@ class WifePlugin(Star):
         tid = str(event.get_sender_id())
         uid = self.parse_at_target(event)
         nick = event.get_sender_name()
+        today = get_today()
         
         grp = swap_requests.get(gid, {})
         rec = grp.get(uid)
@@ -1045,9 +1271,22 @@ class WifePlugin(Star):
             yield event.plain_result(f"{nick}，请在命令后@发起者，或用\"查看交换请求\"命令查看当前请求哦~")
             return
         
+        # 业力锁检查：双方任一有锁则拦截（先读完再 yield，避免持锁 yield）
+        _karma_block_name = None
+        cfg_swap = load_group_config(gid)
+        for _xid in (uid, tid):
+            _xwd = cfg_swap.get(_xid)
+            if isinstance(_xwd, list) and len(_xwd) > 3 and _xwd[3] == "karma_locked" and _xwd[1] == today:
+                _karma_block_name = _xwd[2] if len(_xwd) > 2 else "其中一方"
+                break
+        if _karma_block_name:
+            grp[uid] = rec  # 还原请求
+            yield event.plain_result(f"{_karma_block_name} 业力缠身，无法交换老婆！")
+            return
+
         # 删除请求
         del grp[uid]
-        
+
         # 执行交换
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
@@ -1178,6 +1417,71 @@ class WifePlugin(Star):
         """委托给 HentaiSearcher，供添老婆等功能复用"""
         return await self._hentai_searcher._ai_translate_multi(char=char, source=source)
 
+    def _parse_char_source_arg(self, msg: str, cmd: str) -> tuple[str, str] | None:
+        parts = msg.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            return None
+        raw = parts[1].strip()
+        if "/" in raw:
+            char, source = raw.split("/", 1)
+            return char.strip(), source.strip()
+        return raw, ""
+
+    async def inspect_translation(self, event: AstrMessageEvent):
+        """查看角色翻译档案，方便定位翻译/拉图问题。"""
+        parsed = self._parse_char_source_arg(event.message_str.strip(), "解析角色")
+        if not parsed or not parsed[0]:
+            yield event.plain_result("用法：解析角色 角色名/作品名\n例如：解析角色 紫苑/eden*")
+            return
+        char, source = parsed
+        cached = self._get_translation_from_cache(char, source)
+        trans = cached or await self._ai_translate_multi(char=char, source=source)
+        if not trans:
+            yield event.plain_result("没有解析结果：未配置 nvidia_api_key，且缓存里也没有这条角色。")
+            return
+
+        alt = "、".join(trans.get("alt_char") or []) or "无"
+        src = f"《{source}》" if source else ""
+        from_cache = "是" if cached else "否，本次已尝试写入缓存"
+        lines = [
+            f"角色解析：{src}{char}",
+            f"缓存命中：{from_cache}",
+            f"中文名：{trans.get('zh_char') or '未知'}",
+            f"英文/罗马字：{trans.get('en_char') or '未知'}",
+            f"日文名：{trans.get('ja_char') or '未知'}",
+            f"假名：{trans.get('kana_char') or '未知'}",
+            f"别名：{alt}",
+            f"英文作品名：{trans.get('en_source') or '未知'}",
+            f"日文作品名：{trans.get('ja_source') or '未知'}",
+            f"作品短名：{trans.get('short_source') or '无'}",
+            f"VTuber：{'是' if trans.get('is_vtuber') else '否'}",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    async def retranslate_character(self, event: AstrMessageEvent):
+        """管理员命令：清除某个角色翻译缓存并重新解析。"""
+        uid = str(event.get_sender_id())
+        if uid not in self.admins:
+            yield event.plain_result("只有管理员才能重译角色哦~")
+            return
+        parsed = self._parse_char_source_arg(event.message_str.strip(), "重译角色")
+        if not parsed or not parsed[0]:
+            yield event.plain_result("用法：重译角色 角色名/作品名\n例如：重译角色 紫苑/eden*")
+            return
+        char, source = parsed
+        removed = self.translation_cache.remove(char, source)
+        trans = await self._ai_translate_multi(char=char, source=source)
+        if not trans:
+            yield event.plain_result(f"已清除 {removed} 条缓存，但重新解析失败。请检查 nvidia_api_key 或稍后再试。")
+            return
+        yield event.plain_result(
+            f"已清除 {removed} 条缓存并重新解析：\n"
+            f"英文/罗马字：{trans.get('en_char') or '未知'}\n"
+            f"日文名：{trans.get('ja_char') or '未知'}\n"
+            f"别名：{'、'.join(trans.get('alt_char') or []) or '无'}\n"
+            f"作品短名：{trans.get('short_source') or '无'}"
+        )
+
     # ==================== 添老婆相关 ====================
 
     async def add_wife(self, event: AstrMessageEvent):
@@ -1215,16 +1519,18 @@ class WifePlugin(Star):
                     yield res
                 return
 
-            if not msg.isdigit():
-                return  # 不是数字也不是指令，忽略
-
-            idx = int(msg) - 1
             candidates = session.get("candidates", [])
-            if not (0 <= idx < len(candidates)):
-                yield event.plain_result(f"请输入 1~{len(candidates)} 的数字哦~")
-                return
+            if msg.isdigit():
+                idx = int(msg) - 1
+                if not (0 <= idx < len(candidates)):
+                    yield event.plain_result(f"请输入 1~{len(candidates)} 的数字哦~")
+                    return
+                chosen = candidates[idx]
+            else:
+                chosen = next((c for c in candidates if msg.strip() == c.get("name")), None)
+                if not chosen:
+                    return  # 不是数字、角色名也不是指令，忽略
 
-            chosen = candidates[idx]
             # 用用户输入的 hint_source 覆盖数据库返回的 source
             hint_source = session.get("hint_source", "")
             if hint_source:
@@ -1274,6 +1580,38 @@ class WifePlugin(Star):
                 yield res
             return
 
+        # ── 数据库搜不到时：等待用户补作品名，直接送人工审核 ───────────────
+        if session and session.get("step") == "waiting_manual_source":
+            if session.get("expire_time", 0) <= time.time():
+                add_sessions[gid].pop(uid, None)
+                save_add_sessions()
+                return
+            if msg == "取消":
+                add_sessions[gid].pop(uid, None)
+                save_add_sessions()
+                yield event.plain_result("已取消~")
+                return
+            source = msg.strip()
+            query = session.get("query", "").strip()
+            if not source:
+                yield event.plain_result("作品名不能为空哦，回复作品名即可；不想提交就回复「取消」。")
+                return
+            add_sessions[gid].pop(uid, None)
+            save_add_sessions()
+            virtual = {
+                "name": query,
+                "source": source,
+                "thumb_url": "",
+                "manual_reason": "角色搜索无结果，用户补作品名后送审",
+            }
+            hit = await self._char_exists_in_list(query, source=source)
+            if hit:
+                yield event.plain_result(f"「{query}」已经在老婆库里了哦~（与「{hit}」重复）")
+                return
+            await self._submit_pending(gid, uid, nick, virtual, umo=event.unified_msg_origin)
+            yield event.plain_result(f"已按人工方式提交「《{source}》{query}」，等待管理员审核~")
+            return
+
         # ── 入口：解析关键词 ─────────────────────────────────────────
         parts = msg.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
@@ -1293,7 +1631,7 @@ class WifePlugin(Star):
                 "step": "waiting_input",
                 "query": raw,
                 "source": "",
-                "expire_time": _time.time() + 60,
+                "expire_time": _time.time() + ADD_SESSION_TTL,
             }
             save_add_sessions()
             yield event.plain_result(
@@ -1337,7 +1675,9 @@ class WifePlugin(Star):
                 return
 
         # ── Step 2：搜索角色 ────────────────────────────────────────────
-        all_candidates = await self._search_female_characters(query, limit=offset + 9, source=_hint_source)
+        all_candidates = await self.character_resolver.search_female_characters(
+            query, limit=offset + 9, source=_hint_source
+        )
 
         # ── Step 3：过滤已有角色（精确匹配）──
         existing_pairs = self._load_existing_chars()
@@ -1382,16 +1722,23 @@ class WifePlugin(Star):
 
         if not page:
             if offset == 0:
+                add_sessions.setdefault(gid, {})[uid] = {
+                    "step": "waiting_manual_source",
+                    "query": query,
+                    "expire_time": time.time() + ADD_SESSION_TTL,
+                }
+                save_add_sessions()
                 yield event.plain_result(
                     f"没找到「{query}」相关角色，换个关键词试试？\n"
-                    f"提示：可以用日文名或英文名搜索效果更好"
+                    f"也可以直接回复作品名送人工审核（{ADD_SESSION_TTL}秒内有效）。\n"
+                    f"提示：用日文名或英文名搜索效果通常更好。"
                 )
             else:
                 yield event.plain_result("没有更多候选了，换个关键词试试吧~")
             return
 
         # 发文字列表
-        lines = ["找到以下角色，回复数字选择（60秒内有效）："]
+        lines = [f"找到以下角色，回复数字或角色名选择（{ADD_SESSION_TTL}秒内有效）："]
         for i, c in enumerate(page, 1):
             display_src = c.get('source') or _hint_source
             src = f"《{display_src}》" if display_src else "《来源不明》"
@@ -1416,7 +1763,7 @@ class WifePlugin(Star):
             "offset": offset,
             "candidates": page,
             "hint_source": _hint_source,
-            "expire_time": time.time() + 60,
+            "expire_time": time.time() + ADD_SESSION_TTL,
         }
         save_add_sessions()
 
@@ -1443,12 +1790,36 @@ class WifePlugin(Star):
             return
 
         pending_queue[target_pid]["source"] = source
+        if pending_queue[target_pid].get("status") == ReviewStatus.NEED_SOURCE:
+            pending_queue[target_pid]["status"] = ReviewStatus.PENDING
         save_pending()
         char_name = pending_queue[target_pid]["char_name"]
         yield event.plain_result(f"已补充来源：《{source}》{char_name}，等待管理员审核~")
 
+    async def my_wife_submissions(self, event: AstrMessageEvent):
+        """查看当前用户最近的添老婆申请状态"""
+        uid = str(event.get_sender_id())
+        gid = str(event.message_obj.group_id)
+        items = [
+            (pid, rec) for pid, rec in pending_queue.items()
+            if rec.get("uid") == uid and rec.get("gid") == gid
+        ]
+        if not items:
+            yield event.plain_result("你还没有添老婆申请。可以发「添老婆 角色名/作品名」试试~")
+            return
+
+        lines = ["你的添老婆申请："]
+        for pid, rec in items[-8:]:
+            src = f"《{rec.get('source', '')}》" if rec.get("source") else "（来源未知）"
+            status = ReviewStatus.label(rec.get("status", ReviewStatus.PENDING))
+            lines.append(f"- {src}{rec.get('char_name', '')}：{status}（{pid}）")
+        lines.append("来源未知的条目可用「补充来源 作品名」补上。")
+        yield event.plain_result("\n".join(lines))
+
     async def _refresh_list_cache(self):
-        """定时拉取 list.txt 缓存到本地，每小时刷新一次"""
+        """定时拉取 list.txt 缓存到本地，每小时刷新一次，同步更新内存缓存"""
+        global _list_cache_mem
+        img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp")
         cache_path = os.path.join(CONFIG_DIR, "list_cache.txt")
         while True:
             try:
@@ -1460,7 +1831,12 @@ class WifePlugin(Star):
                                 text = await r.text()
                                 with open(cache_path, "w", encoding="utf-8") as f:
                                     f.write(text)
-                                logger.info(f"[添老婆] list.txt 缓存已更新，共 {len(text.splitlines())} 条")
+                                # 同步更新内存缓存
+                                _list_cache_mem = [
+                                    l.strip() for l in text.splitlines()
+                                    if l.strip() and "!" in l and l.strip().lower().endswith(img_exts)
+                                ]
+                                logger.info(f"[list缓存] 已更新，共 {len(_list_cache_mem)} 条有效图片")
             except Exception as e:
                 logger.error(f"[添老婆] 拉取 list 缓存失败: {e}")
             await asyncio.sleep(3600)  # 每小时刷新一次
@@ -1468,27 +1844,28 @@ class WifePlugin(Star):
     # ── 英文名缓存 ──────────────────────────────────────────────────────────
 
     def _load_en_cache(self) -> dict:
-        """加载英文名缓存 {char_name: {"en": str, "alt": [str]}}"""
-        return load_json(EN_CACHE_FILE)
+        return self.translation_cache.load()
 
     def _save_en_cache(self, cache: dict) -> None:
-        save_json(EN_CACHE_FILE, cache)
+        self.translation_cache.save(cache)
 
     def _get_en_name_from_cache(self, char: str, source: str = "") -> str | None:
-        """供 HentaiSearcher 查询英文名的回调，查不到返回 None。"""
-        cache = self._load_en_cache()
-        # 优先用 char|source 组合键，没有再退回纯 char 键
-        for key in (f"{char}|{source}" if source else None, char):
-            if not key:
-                continue
-            entry = cache.get(key)
-            if not entry:
-                continue
-            if isinstance(entry, dict):
-                return entry.get("en") or None
-            if isinstance(entry, str):
-                return entry or None
-        return None
+        return self.translation_cache.get_en_name(char, source)
+
+    def _cache_key(self, char: str, source: str = "") -> str:
+        return self.translation_cache.key(char, source)
+
+    def _normalize_translation_entry(self, entry: dict, char: str = "", source: str = "") -> dict:
+        return self.translation_cache.normalize(entry, char, source)
+
+    def _get_translation_from_cache(self, char: str, source: str = "") -> dict | None:
+        return self.translation_cache.get_profile(char, source)
+
+    def _write_translation_cache_sync(self, char: str, source: str, result: dict) -> None:
+        self.translation_cache.write_profile(char, source, result)
+
+    def _write_en_name_cache_sync(self, char: str, source: str, en_name: str, alt_chars: list | None = None) -> None:
+        self.translation_cache.write_en_name(char, source, en_name, alt_chars)
 
     def _load_existing_chars(self) -> list[tuple[str, str]]:
         """从 list_cache.txt 读取所有已存在的角色，返回 [(source, char_name), ...]"""
@@ -1628,7 +2005,14 @@ query ($search: String) {
             en = (trans.get("en_char") or "").strip()
             alt = [a.strip() for a in (trans.get("alt_char") or []) if a.strip()]
         if en:
-            cache[cache_key] = {"en": en, "alt": alt}
+            cached_trans = self._get_translation_from_cache(char_name, source) or {}
+            cache[cache_key] = {
+                **cached_trans,
+                "en_char": en,
+                "en": en,
+                "alt_char": alt,
+                "alt": alt,
+            }
             self._save_en_cache(cache)
             logger.info("[缓存] 写入: %r -> en=%r alt=%s" % (cache_key, en, alt))
 
@@ -1707,6 +2091,19 @@ query ($search: String) {
 
         return None
 
+
+    async def _bg_flush_drawn_pool(self):
+        """后台定时任务：每5分钟把去重池脏数据写盘，减少 IO 频率。"""
+        while True:
+            await asyncio.sleep(300)  # 5分钟
+            global _drawn_pool_dirty
+            if _drawn_pool_dirty:
+                try:
+                    save_drawn_pool()
+                    logger.info("[去重池] 定时写盘完成")
+                except Exception as e:
+                    logger.error(f"[去重池] 定时写盘失败: {e}")
+
     async def _bg_fill_en_cache(self):
         """启动后台任务：静默补全存量角色的英文名缓存。
 
@@ -1741,7 +2138,14 @@ query ($search: String) {
                     en  = (res.get("en_char") or "").strip()
                     alt = [a.strip() for a in (res.get("alt_char") or []) if a.strip()]
                 if en:
-                    cache[cache_key] = {"en": en, "alt": alt}
+                    cached_trans = self._get_translation_from_cache(char_name, src) or {}
+                    cache[cache_key] = {
+                        **cached_trans,
+                        "en_char": en,
+                        "en": en,
+                        "alt_char": alt,
+                        "alt": alt,
+                    }
                     done += 1
                     if done % 100 == 0:
                         self._save_en_cache(cache)
@@ -1789,7 +2193,14 @@ query ($search: String) {
                     en  = (res.get("en_char") or "").strip()
                     alt = [a.strip() for a in (res.get("alt_char") or []) if a.strip()]
                 if en:
-                    cache[cache_key] = {"en": en, "alt": alt}
+                    cached_trans = self._get_translation_from_cache(char_name, src) or {}
+                    cache[cache_key] = {
+                        **cached_trans,
+                        "en_char": en,
+                        "en": en,
+                        "alt_char": alt,
+                        "alt": alt,
+                    }
                     done += 1
                 else:
                     failed += 1
@@ -1811,182 +2222,36 @@ query ($search: String) {
         )
 
     async def _search_female_characters(self, name: str, limit: int = 5, source: str = "") -> list[dict]:
-        """搜索女性角色：先 Bangumi 搜中文名，取日文原名再搜 AniList，source 过滤候选"""
-
-        def _src_match(candidate_src: str, filter_src: str) -> bool:
-            """宽松的作品名匹配：只要 filter_src 出现在 candidate_src 里（或反向）即算命中"""
-            a = candidate_src.strip().lower()
-            b = filter_src.strip().lower()
-            return bool(a and b and (b in a or a in b))
-
-        seen: set = set()
-        results: list = []
-
-        def _add(r: dict):
-            key = r["name"].strip().lower()
-            if key not in seen:
-                seen.add(key)
-                results.append(r)
-
-        # ── Step 1：Bangumi 搜原始名（中文/日文都支持）─────────────────
-        bgm_results = await self._search_bangumi(name, limit * 3)
-        ja_names_from_bgm: list[str] = []
-        for r in bgm_results:
-            if source and not _src_match(r.get("source", ""), source):
-                continue  # source 对不上，跳过
-            _add(r)
-            # 收集角色名供 AniList 二次搜索（Bangumi name 字段通常是日文原名，AniList 也接受）
-            ja = r["name"]
-            if ja and ja != name and ja not in ja_names_from_bgm:
-                ja_names_from_bgm.append(ja)
-
-        # ── Step 2：用 Bangumi 拿到的日文原名搜 AniList ──────────────
-        for ja in ja_names_from_bgm[:2]:  # 最多取前2个日文名去搜
-            if len(results) >= limit:
-                break
-            ani_results = await self._search_anilist(ja, limit)
-            for r in ani_results:
-                if source and not _src_match(r.get("source", ""), source):
-                    continue
-                _add(r)
-
-        # ── Step 3：如果结果还不够，直接用原始名搜 AniList 补充 ───────
-        if len(results) < limit:
-            ani_results = await self._search_anilist(name, limit)
-            for r in ani_results:
-                if source and not _src_match(r.get("source", ""), source):
-                    continue
-                _add(r)
-
-        # ── Step 4：如果 source 过滤后结果为空，放开过滤再搜一次 ──────
-        if not results:
-            for r in bgm_results:
-                _add(r)
-            if len(results) < limit:
-                ani_results = await self._search_anilist(name, limit)
-                for r in ani_results:
-                    _add(r)
-
-        return results[:limit]
-
+        """Compatibility wrapper around CharacterResolver."""
+        return await self.character_resolver.search_female_characters(name, limit=limit, source=source)
 
     async def _search_bangumi(self, name: str, limit: int) -> list[dict]:
-        """Bangumi v0 POST 搜索角色"""
-        try:
-            url = "https://api.bgm.tv/v0/search/characters"
-            headers = {"User-Agent": "astrbot_plugin_animewifex/1.0", "Content-Type": "application/json"}
-            body = {"keyword": name, "filter": {}}
-            params = {"limit": limit * 3, "offset": 0}
-            async with aiohttp.ClientSession() as s:
-                async with s.post(url, json=body, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    if r.status != 200:
-                        logger.warning("[添老婆][Bangumi] HTTP %d" % r.status)
-                        return []
-                    data = await r.json()
-        except Exception as e:
-            logger.error(f"[添老婆] Bangumi 搜索失败: {e}")
-            return []
-
-        items = data.get("data") or []
-        logger.info("[添老婆][Bangumi] 搜索 %r 返回%d条: %s" % (name, len(items), [(x.get("name"), x.get("gender")) for x in items[:10]]))
-        results = []
-        for item in items:
-            if item.get("gender") == "male":  # 排除明确男性
-                continue
-            char_name = item.get("name", "")
-            if not char_name:
-                continue
-            char_source = ""
-            for info in item.get("infobox", []):
-                key = info.get("key", "")
-                if key in ("登场作品", "组合", "出处", "所属作品", "来源作品"):
-                    val = info.get("value", "")
-                    if isinstance(val, list):
-                        val = val[0].get("v", "") if val else ""
-                    char_source = str(val).strip()
-                    if char_source:
-                        break
-            images = item.get("images", {})
-            thumb = images.get("small") or images.get("medium") or ""
-            if thumb and not thumb.startswith("http"):
-                thumb = "https:" + thumb
-            results.append({"name": char_name, "source": char_source, "thumb_url": thumb})
-            if len(results) >= limit:
-                break
-        logger.info("[添老婆][Bangumi] 过滤后: %s" % [r["name"] for r in results])
-        return results
+        """Compatibility wrapper around CharacterResolver."""
+        return await self.character_resolver.search_bangumi(name, limit)
 
     async def _search_anilist(self, name: str, limit: int) -> list[dict]:
-        """AniList GraphQL 搜索角色"""
-        query = """
-query ($search: String) {
-  Page(page: 1, perPage: 20) {
-    characters(search: $search) {
-      name { full native }
-      gender
-      image { medium }
-      media(perPage: 1) {
-        nodes { title { native romaji english } }
-      }
-    }
-  }
-}
-"""
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    "https://graphql.anilist.co",
-                    json={"query": query, "variables": {"search": name}},
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    if r.status != 200:
-                        body = await r.text()
-                        logger.warning("[添老婆][AniList] HTTP %d body=%s" % (r.status, body[:300]))
-                        return []
-                    data = await r.json()
-        except Exception as e:
-            logger.error(f"[添老婆] AniList 搜索失败: {e}")
-            return []
+        """Compatibility wrapper around CharacterResolver."""
+        return await self.character_resolver.search_anilist(name, limit)
 
-        chars = data.get("data", {}).get("Page", {}).get("characters", [])
-        logger.info("[添老婆][AniList] 搜索 %r 返回%d条: %s" % (name, len(chars), [(c.get("name",{}).get("full"), c.get("gender")) for c in chars[:10]]))
-        def _is_japanese(s):
-            return any("\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff" for ch in s)
-        def _is_korean(s):
-            return any("\uac00" <= ch <= "\ud7a3" for ch in s)
-        results = []
-        for c in chars:
-            gender = (c.get("gender") or "").lower()
-            if gender == "male":
-                continue
-            native = c["name"].get("native") or ""
-            full   = c["name"].get("full") or ""
-            if native and _is_japanese(native):
-                char_name = native
-            elif full and not _is_korean(full):
-                char_name = full
-            elif native:
-                char_name = native
-            else:
-                char_name = full
-            if not char_name:
-                continue
-            media_nodes = (c.get("media") or {}).get("nodes", [])
-            source = ""
-            if media_nodes:
-                t = media_nodes[0].get("title", {})
-                source = t.get("native") or t.get("romaji") or t.get("english") or ""
-            thumb = (c.get("image") or {}).get("medium") or ""
-            results.append({"name": char_name, "source": source, "thumb_url": thumb})
-            if len(results) >= limit:
-                break
-        logger.info("[添老婆][AniList] 过滤后: %s" % [r["name"] for r in results])
-        return results
+    async def _search_vndb_characters(self, name: str, limit: int, source: str = "") -> list[dict]:
+        """Compatibility wrapper around CharacterResolver."""
+        return await self.character_resolver.search_vndb_characters(name, limit, source=source)
 
     async def _submit_pending(self, gid: str, uid: str, nick: str, chosen: dict, umo: str = ""):
         """存入待审核队列并私聊管理员"""
         import time
+        # 队列超500条时清理已完成的旧记录
+        if len(pending_queue) > 500:
+            done_pids = [
+                pid for pid, rec in pending_queue.items()
+                if rec.get("status") in ReviewStatus.DONE
+            ]
+            to_remove = done_pids[:max(0, len(pending_queue) - 400)]
+            for pid in to_remove:
+                del pending_queue[pid]
+            if to_remove:
+                save_pending()
+                logger.info(f"[pending] 自动清理旧记录 {len(to_remove)} 条")
         pid = f"{gid}_{uid}_{int(time.time())}"
         # 从 umo 提取平台前缀，如 "ATRI:GroupMessage:xxx" -> "ATRI"
         platform = umo.split(":")[0] if umo else "default"
@@ -1998,7 +2263,8 @@ query ($search: String) {
             "char_name": chosen["name"],
             "source": chosen.get("source", ""),
             "thumb_url": chosen.get("thumb_url", ""),
-            "status": "pending",
+            "manual_reason": chosen.get("manual_reason", ""),
+            "status": ReviewStatus.PENDING if chosen.get("source", "") else ReviewStatus.NEED_SOURCE,
             "submit_time": int(time.time()),
             "platform": platform,
         }
@@ -2050,7 +2316,7 @@ query ($search: String) {
 
             pr_url = await self._create_github_pr(rec["source"], rec["char_name"], img_dir, images)
             if pr_url:
-                rec["status"] = "pr_created"
+                rec["status"] = ReviewStatus.PR_CREATED
                 rec["pr_url"] = pr_url
                 save_pending()
                 yield event.plain_result(
@@ -2062,7 +2328,9 @@ query ($search: String) {
 
         elif action == "换图":
             yield event.plain_result(f"正在重新拉取「{src}{rec['char_name']}」图片...")
-            images = await self._fetch_character_images(rec["char_name"], rec.get("source", ""), count=3)
+            images = await self._fetch_character_images(
+                rec["char_name"], rec.get("source", ""), count=3, fallback_thumb_url=rec.get("thumb_url", "")
+            )
             if not images:
                 yield event.plain_result("仍未找到图片，请用「跳过」走手动流程")
                 return
@@ -2071,6 +2339,8 @@ query ($search: String) {
                 "img_dir": img_dir,
                 "expire_time": _t.time() + 300,
             }
+            rec["status"] = ReviewStatus.IMAGE_READY
+            save_pending()
             platform = rec.get("platform", "default")
             admin_umo = f"{platform}:FriendMessage:{self.admin_qq}"
             await self.context.send_message(
@@ -2103,7 +2373,7 @@ query ($search: String) {
             yield event.plain_result(f"正在为「{src}{rec['char_name']}」创建空 PR...")
             pr_url = await self._create_github_pr_empty(rec["source"], rec["char_name"], img_dir)
             if pr_url:
-                rec["status"] = "pr_created"
+                rec["status"] = ReviewStatus.PR_CREATED
                 rec["pr_url"] = pr_url
                 save_pending()
                 yield event.plain_result(
@@ -2126,7 +2396,9 @@ query ($search: String) {
             f"【添老婆审核】\n"
             f"提交人：{rec['nick']}（{rec['uid']}）\n"
             f"角色：{src}{rec['char_name']}\n"
-            f"群组：{rec['gid']}\n\n"
+            f"群组：{rec['gid']}\n" +
+            (f"备注：{rec.get('manual_reason')}\n" if rec.get("manual_reason") else "") +
+            "\n"
             f"回复「通过 {pid}」或「拒绝 {pid}」" +
             ("\n⚠️ 来源未知，可用「通过 " + pid + " 作品名」同时补充来源" if not rec['source'] else "")
         )
@@ -2146,6 +2418,12 @@ query ($search: String) {
         uid = str(event.get_sender_id())
         if uid != str(self.admin_qq):
             return
+
+        # 清理过期的图片确认会话，防止图片bytes堆积内存
+        import time as _t
+        expired = [pid for pid, s in admin_img_sessions.items() if s.get("expire_time", 0) < _t.time()]
+        for pid in expired:
+            admin_img_sessions.pop(pid, None)
 
         msg = event.message_str.strip()
 
@@ -2181,7 +2459,10 @@ query ($search: String) {
 
         # ── 拉取老婆审核 ────────────────────────────────────────────────────
         if msg == "拉取老婆审核":
-            pendings = {pid: rec for pid, rec in pending_queue.items() if rec.get("status") == "pending"}
+            pendings = {
+                pid: rec for pid, rec in pending_queue.items()
+                if rec.get("status", ReviewStatus.PENDING) in ReviewStatus.OPEN
+            }
             if not pendings:
                 yield event.plain_result("✅ 当前没有待审核的添老婆申请。")
                 return
@@ -2193,6 +2474,8 @@ query ($search: String) {
                 entry = "[" + str(i) + "] 👤" + rec["nick"] + "（" + rec["uid"] + "）\n"
                 entry += "    角色：" + src + rec["char_name"] + "\n"
                 entry += "    群：" + rec["gid"]
+                if rec.get("manual_reason"):
+                    entry += "\n    备注：" + rec["manual_reason"]
                 if not rec.get("source"):
                     entry += "\n    ⚠️ 来源未知，可用「通过 " + str(i) + " 作品名」补充"
                 lines.append(entry)
@@ -2214,10 +2497,10 @@ query ($search: String) {
             if not rec:
                 yield event.plain_result(f"找不到记录：{pid}")
                 return
-            if rec.get("status") == "online":
+            if rec.get("status") == ReviewStatus.ONLINE:
                 yield event.plain_result("该角色已经上线过了~")
                 return
-            rec["status"] = "online"
+            rec["status"] = ReviewStatus.ONLINE
             save_pending()
             src = f"《{rec['source']}》" if rec.get("source") else ""
             char_name = rec["char_name"]
@@ -2246,7 +2529,7 @@ query ($search: String) {
             return
 
         if action == "拒绝":
-            rec["status"] = "rejected"
+            rec["status"] = ReviewStatus.REJECTED
             save_pending()
             src = f"《{rec['source']}》" if rec['source'] else ""
             yield event.plain_result(f"已拒绝「{src}{rec['char_name']}」")
@@ -2254,13 +2537,13 @@ query ($search: String) {
             await self._notify_group_at(rec["gid"], rec["uid"], f"你提交的「{src}{rec['char_name']}」审核未通过~", platform)
             return
 
-        if rec.get("status") in ("approved", "pr_created", "online"):
-            yield event.plain_result(f"该申请已处理过（状态：{rec['status']}），请勿重复操作")
+        if rec.get("status") in ReviewStatus.LOCKED:
+            yield event.plain_result(f"该申请已处理过（状态：{ReviewStatus.label(rec['status'])}），请勿重复操作")
             return
         # ── 通过：先拉图私聊确认，再创建 PR ──────────────────────────────
         if override_source:
             rec["source"] = override_source
-        rec["status"] = "approved"
+        rec["status"] = ReviewStatus.APPROVED
         save_pending()
         src = f"《{rec['source']}》" if rec['source'] else ""
         # 后台写入英文名缓存，不阻塞审核流程
@@ -2269,14 +2552,16 @@ query ($search: String) {
         img_dir = self._get_img_dir(rec["source"])
         yield event.plain_result(f"已通过「{src}{rec['char_name']}」，正在拉取图片供确认...")
 
-        images = await self._fetch_character_images(rec["char_name"], rec.get("source", ""), count=3)
+        images = await self._fetch_character_images(
+            rec["char_name"], rec.get("source", ""), count=3, fallback_thumb_url=rec.get("thumb_url", "")
+        )
 
         if not images:
             # 拉不到图，直接走空 PR 流程
             yield event.plain_result("未找到图片，直接创建空 PR...")
             pr_url = await self._create_github_pr_empty(rec["source"], rec["char_name"], img_dir)
             if pr_url:
-                rec["status"] = "pr_created"
+                rec["status"] = ReviewStatus.PR_CREATED
                 rec["pr_url"] = pr_url
                 save_pending()
                 yield event.plain_result(
@@ -2295,6 +2580,8 @@ query ($search: String) {
             "img_dir": img_dir,
             "expire_time": _t.time() + 300,
         }
+        rec["status"] = ReviewStatus.IMAGE_READY
+        save_pending()
 
         # 私聊发图：逐张带编号，管理员可回「选 N」指定用哪张
         platform = rec.get("platform", "default")
@@ -2347,11 +2634,11 @@ query ($search: String) {
             yield event.plain_result(f"找不到记录：{pid}")
             return
 
-        if rec.get("status") == "online":
+        if rec.get("status") == ReviewStatus.ONLINE:
             yield event.plain_result("该角色已经上线过了~")
             return
 
-        rec["status"] = "online"
+        rec["status"] = ReviewStatus.ONLINE
         save_pending()
 
         src = f"《{rec['source']}》" if rec.get("source") else ""
@@ -2367,1096 +2654,33 @@ query ($search: String) {
         )
         yield event.plain_result(f"✅ 已通知群 {gid}：{src}{char_name} 上线成功~")
 
-    async def _fetch_character_images(self, char_name: str, source: str, count: int = 3) -> list[bytes]:
-        """拉图优先级：Pixiv → Gelbooru → Yande.re → Danbooru → Konachan → DLsite封面（终极保底）"""
-        translations = await self._ai_translate_multi(char=char_name, source=source)
-        en_name      = translations.get("en_char",     char_name)
-        ja_name      = translations.get("ja_char",     char_name)
-        kana_name    = translations.get("kana_char",   "")
-        alt_chars    = translations.get("alt_char",    [])   # 别名列表
-        en_source    = translations.get("en_source",   source)
-        ja_source    = translations.get("ja_source",   source)
-        short_source = translations.get("short_source", "")  # 同人圈缩写
-
-        def to_tag(s: str) -> str:
-            return s.strip().lower().replace(" ", "_").replace("·", "_").replace("・", "_")
-
-        # 角色 booru tag 候选：英文名 → 日文名 → 别名 → 原始输入，全部转下划线格式
-        char_tag_sources = [en_name, ja_name] + alt_chars + [char_name]
-        booru_char_tags = list(dict.fromkeys(to_tag(s) for s in char_tag_sources if s and s.strip()))
-
-        # 带作品限定的组合 tag（booru 标准写法：角色tag + 作品tag）
-        source_tag_sources = [short_source, en_source, ja_source, source]
-        booru_src_tags = list(dict.fromkeys(to_tag(s) for s in source_tag_sources if s and s.strip()))
-
-        # booru 搜索顺序：优先「角色+作品」组合，再退回纯角色名
-        booru_tags = []
-        for ctag in booru_char_tags:
-            for stag in booru_src_tags:
-                booru_tags.append(f"{ctag} {stag}")  # 组合 tag，命中更精准
-        booru_tags += booru_char_tags   # 纯角色名兜底
-
-        # Pixiv 搜索词：优先「角色名 作品名」组合，精准度更高
-        pixiv_combined = []
-        for cname in [ja_name, en_name, char_name]:
-            for sname in [ja_source, short_source, source]:
-                if cname and sname and cname.strip() and sname.strip():
-                    pixiv_combined.append(f"{cname.strip()} {sname.strip()}")
-        pixiv_tag_sources = pixiv_combined + [en_name, ja_name] + alt_chars + [char_name]
-        pixiv_tags = list(dict.fromkeys(s.strip() for s in pixiv_tag_sources if s and s.strip()))
-
-        # Getchu/DLsite 作品查询词顺序：日文原名 → 缩写 → 英文 → 原始输入
-        source_queries = list(dict.fromkeys(filter(None, [ja_source, short_source, en_source, source])))
-
-        logger.info(
-            "[添老婆] 拉图 booru_char_tags=%s booru_src_tags=%s pixiv_tags=%s short_source=%r"
-            % (booru_char_tags, booru_src_tags, pixiv_tags, short_source)
+    async def _fetch_character_images(
+        self, char_name: str, source: str, count: int = 3, fallback_thumb_url: str = ""
+    ) -> list[bytes]:
+        """Fetch candidate review images through the image service."""
+        return await self.image_fetcher.fetch_character_images(
+            char_name=char_name,
+            source=source,
+            count=count,
+            fallback_thumb_url=fallback_thumb_url,
         )
 
-        images = []
-
-        # 1. Pixiv 优先
-        if self.pixiv_refresh_token and len(images) < count:
-            for q in pixiv_tags:
-                if len(images) >= count:
-                    break
-                images.extend(await self._pixiv_fetch(q, count - len(images)))
-            logger.info("[添老婆] Pixiv 后共%d张" % len(images))
-
-        # 2. 自定义图源（extra_image_sources 配置，Pixiv 之后、booru 之前）
-        extra_sources_raw = self.config.get("extra_image_sources", "")
-        extra_sources = [s.strip() for s in extra_sources_raw.split(",") if s.strip()]
-        if extra_sources and len(images) < count:
-            for src_name in extra_sources:
-                if len(images) >= count:
-                    break
-                for q in pixiv_tags:
-                    if len(images) >= count:
-                        break
-                    images.extend(await self._custom_source_fetch(src_name, q, count - len(images)))
-            logger.info("[添老婆] 自定义图源(%s)后共%d张" % (",".join(extra_sources), len(images)))
-
-        # 3. e-shuushuu（有 token 时）
-        if len(images) < count and self.config.get("shuushuu_access_token"):
-            images.extend(await self._shuushuu_fetch(
-                char_name, en_name, kana_name, source, count - len(images)
-            ))
-            logger.info("[添老婆] shuushuu 后共%d张" % len(images))
-
-        # 4. Gelbooru（rating:general 过滤 R18）
-        if len(images) < count:
-            for q in booru_tags:
-                if len(images) >= count:
-                    break
-                images.extend(await self._gelbooru_fetch(q, count - len(images)))
-            logger.info("[添老婆] Gelbooru 后共%d张" % len(images))
-
-        # 4. Yande.re（rating:safe）
-        if len(images) < count:
-            for q in booru_tags:
-                if len(images) >= count:
-                    break
-                images.extend(await self._yandere_fetch(q, count - len(images)))
-            logger.info("[添老婆] Yande.re 后共%d张" % len(images))
-
-        # 5. Danbooru
-        if len(images) < count:
-            for q in booru_tags:
-                if len(images) >= count:
-                    break
-                images.extend(await self._danbooru_fetch(q, count - len(images)))
-            logger.info("[添老婆] Danbooru 后共%d张" % len(images))
-
-        # 6. Konachan
-        if len(images) < count:
-            for q in booru_tags:
-                if len(images) >= count:
-                    break
-                images.extend(await self._konachan_fetch(q, count - len(images)))
-            logger.info("[添老婆] Konachan 后共%d张" % len(images))
-
-        # 7. Getchu 立绘（官方宣传素材，完全拉不到同人图才走）
-        if not images:
-            logger.info("[添老婆] 同人图源均失败，尝试 Getchu 官方立绘")
-            for q in source_queries:
-                imgs = await self._getchu_fetch(q, count)
-                if imgs:
-                    images.extend(imgs)
-                    logger.info("[添老婆] Getchu 后共%d张" % len(images))
-                    break
-
-        # 8. DLsite 封面（终极最后保底）
-        if not images:
-            logger.info("[添老婆] Getchu 也失败，尝试 DLsite 封面保底")
-            for q in source_queries:
-                imgs = await self._dlsite_cover_fetch(q, count)
-                if imgs:
-                    images.extend(imgs)
-                    logger.info("[添老婆] DLsite封面 后共%d张" % len(images))
-                    break
-
-        return images[:count]
-
-    async def _shuushuu_fetch(
-        self, char_name: str, en_name: str, kana_name: str, source: str, count: int
-    ) -> list[bytes]:
-        """e-shuushuu 拉图：VNDB 查英文名 → 查 tag_id → 用作品 tag 搜图过滤角色 tag"""
-        images = []
-        shuushuu_access  = self.config.get("shuushuu_access_token", "")
-        shuushuu_refresh = self.config.get("shuushuu_refresh_token", "")
-        if not shuushuu_access:
-            return []
-
-        cookie_str = f"access_token={shuushuu_access}; refresh_token={shuushuu_refresh}"
-        headers_base = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-            "Cookie": cookie_str,
-            "Referer": "https://e-shuushuu.net/",
-        }
-
-        try:
-            async with aiohttp.ClientSession() as s:
-                # Step 1: VNDB 查英文名
-                vndb_en = ""
-                for sname in list(dict.fromkeys(filter(None, [kana_name, char_name]))):
-                    vndb_en = await self._vndb_lookup_en(s, sname, source)
-                    if vndb_en:
-                        break
-
-                char_query = vndb_en or en_name
-                if not char_query:
-                    logger.info("[shuushuu] 无英文名，跳过")
-                    return []
-
-                logger.info("[shuushuu] char_query=%r source=%r" % (char_query, source))
-
-                # Step 2: 查角色 tag_id
-                char_tag_id = await self._shuushuu_find_tag(s, headers_base, char_query, source, tag_type=4)
-                if not char_tag_id:
-                    logger.info("[shuushuu] 找不到角色 tag，跳过")
-                    return []
-
-                # Step 3: 查作品 tag_id（可选）
-                source_tag_id = None
-                if source:
-                    source_tag_id = await self._shuushuu_find_tag(s, headers_base, source, "", tag_type=None)
-
-                # Step 4: 搜图
-                images = await self._shuushuu_fetch_images(s, headers_base, char_tag_id, source_tag_id, count)
-
-        except Exception as e:
-            logger.error("[shuushuu] 拉图失败: %s" % e)
-        return images
-
-    async def _vndb_lookup_en(
-        self, session: aiohttp.ClientSession, char_name: str, source: str
-    ) -> str:
-        """VNDB 查角色英文名，结合 source 过滤"""
-        try:
-            payload = {
-                "filters": ["search", "=", char_name],
-                "fields": "id,name,original,vns.title,vns.alttitle",
-                "results": 20,
-            }
-            async with session.post(
-                "https://api.vndb.org/kana/character",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                if r.status != 200:
-                    return ""
-                data = await r.json()
-            results = data.get("results", [])
-            source_low = source.strip().lower()
-            scored = []
-            for c in results:
-                name = c.get("name", "")
-                original = c.get("original") or ""
-                vn_titles = " ".join(
-                    (v.get("title") or "") + " " + (v.get("alttitle") or "")
-                    for v in c.get("vns", [])
-                ).lower()
-                score = 0
-                if original == char_name: score += 10
-                if source_low and source_low in vn_titles: score += 15
-                scored.append((score, name))
-            scored.sort(reverse=True)
-            if scored and scored[0][0] > 0:
-                logger.info("[shuushuu][VNDB] %r -> %r" % (char_name, scored[0][1]))
-                return scored[0][1]
-        except Exception as e:
-            logger.warning("[shuushuu][VNDB] 查询失败: %s" % e)
-        return ""
-
-    async def _shuushuu_find_tag(
-        self, session: aiohttp.ClientSession, headers: dict,
-        query: str, source: str, tag_type: int | None
-    ) -> int | None:
-        """查 shuushuu tag_id"""
-        try:
-            url = f"https://e-shuushuu.net/api/v1/tags/?search={quote(query)}&limit=20"
-            async with session.get(
-                url,
-                headers={**headers, "Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-            tags = data.get("tags", [])
-            if not tags:
-                return None
-
-            source_low = source.strip().lower()
-            query_low  = query.strip().lower()
-
-            # 精确匹配
-            for t in tags:
-                if tag_type is not None and t.get("type") != tag_type:
-                    continue
-                if t["title"].lower() == query_low:
-                    logger.info("[shuushuu] 精确命中 tag=%r id=%d" % (t["title"], t["tag_id"]))
-                    return t["tag_id"]
-
-            # source 辅助过滤
-            if source_low:
-                for t in tags:
-                    if tag_type is not None and t.get("type") != tag_type:
-                        continue
-                    haystack = (t["title"] + " " + (t.get("desc") or "")).lower()
-                    if source_low in haystack:
-                        logger.info("[shuushuu] source命中 tag=%r id=%d" % (t["title"], t["tag_id"]))
-                        return t["tag_id"]
-
-            # usage_count 最高
-            filtered = [t for t in tags if tag_type is None or t.get("type") == tag_type]
-            if filtered:
-                best = max(filtered, key=lambda t: t.get("usage_count", 0))
-                logger.info("[shuushuu] usage最高 tag=%r id=%d" % (best["title"], best["tag_id"]))
-                return best["tag_id"]
-        except Exception as e:
-            logger.warning("[shuushuu] tag查询失败: %s" % e)
-        return None
-
-    async def _shuushuu_fetch_images(
-        self, session: aiohttp.ClientSession, headers: dict,
-        char_tag_id: int, source_tag_id: int | None, count: int
-    ) -> list[bytes]:
-        """shuushuu 搜图并下载"""
-        images = []
-        try:
-            search_tag_id = source_tag_id if source_tag_id else char_tag_id
-            url = f"https://e-shuushuu.net/api/v1/images/?tags={search_tag_id}&limit={min(count * 6, 40)}"
-            async with session.get(
-                url,
-                headers={**headers, "Accept": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status != 200:
-                    logger.warning("[shuushuu] 搜图 HTTP %d" % r.status)
-                    return []
-                data = await r.json()
-
-            all_images = data.get("images", [])
-            logger.info("[shuushuu] 搜图 tag_id=%d 返回%d条" % (search_tag_id, len(all_images)))
-
-            # 有 source_tag 时过滤含 char_tag_id 的图
-            if source_tag_id:
-                all_images = [
-                    img for img in all_images
-                    if any(
-                        (t.get("tag_id") if isinstance(t, dict) else t) == char_tag_id
-                        for t in (img.get("tags") or [])
-                    )
-                ]
-                logger.info("[shuushuu] 过滤后含角色tag的%d条" % len(all_images))
-
-            random.shuffle(all_images)
-            async with aiohttp.ClientSession() as dl:
-                for img in all_images:
-                    if len(images) >= count:
-                        break
-                    fn  = img.get("filename", "")
-                    ext = img.get("ext", "jpg")
-                    if not fn:
-                        continue
-                    img_url = f"https://e-shuushuu.net/images/{fn}.{ext}"
-                    try:
-                        async with dl.get(
-                            img_url,
-                            headers={"User-Agent": headers["User-Agent"]},
-                            timeout=aiohttp.ClientTimeout(total=20),
-                        ) as r:
-                            if r.status == 200:
-                                img_data = await r.read()
-                                if len(img_data) > 10 * 1024:
-                                    images.append(img_data)
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[shuushuu] 下载图片失败: %s" % e)
-        return images
-
-    async def _gelbooru_fetch(self, query: str, count: int) -> list[bytes]:
-        """Gelbooru 拉图，仅取 rating:general"""
-        images = []
-        try:
-            params = {
-                "page": "dapi", "s": "post", "q": "index", "json": 1,
-                "tags": f"{query} rating:general",
-                "limit": min(count * 4, 40),
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://gelbooru.com/index.php",
-                    params=params,
-                    headers={"User-Agent": "astrbot_plugin_animewifex/1.0"},
-                    cookies={"fringeBenefits": "yep"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as r:
-                    if r.status != 200:
-                        logger.warning("[添老婆][Gelbooru] HTTP %d query=%r" % (r.status, query))
-                        return []
-                    data = await r.json()
-            posts = data.get("post") or []
-            logger.info("[添老婆][Gelbooru] query=%r 返回%d条" % (query, len(posts)))
-            random.shuffle(posts)
-            async with aiohttp.ClientSession() as s:
-                for post in posts:
-                    if len(images) >= count:
-                        break
-                    url = post.get("sample_url") or post.get("file_url")
-                    if not url:
-                        continue
-                    if url.rsplit(".", 1)[-1].lower() not in ("jpg", "jpeg", "png", "webp"):
-                        continue
-                    try:
-                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                            if r.status == 200:
-                                images.append(await r.read())
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[添老婆] Gelbooru 拉图失败: %s" % e)
-        return images
-
-    async def _yandere_fetch(self, query: str, count: int) -> list[bytes]:
-        """Yande.re 拉图，仅取 rating:safe"""
-        images = []
-        try:
-            params = {"tags": f"{query} rating:s", "limit": min(count * 4, 40), "page": 1}
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://yande.re/post.json",
-                    params=params,
-                    headers={"User-Agent": "astrbot_plugin_animewifex/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as r:
-                    if r.status != 200:
-                        logger.warning("[添老婆][Yande.re] HTTP %d query=%r" % (r.status, query))
-                        return []
-                    posts = await r.json()
-            logger.info("[添老婆][Yande.re] query=%r 返回%d条" % (query, len(posts)))
-            random.shuffle(posts)
-            async with aiohttp.ClientSession() as s:
-                for post in posts:
-                    if len(images) >= count:
-                        break
-                    url = post.get("sample_url") or post.get("jpeg_url") or post.get("file_url")
-                    if not url:
-                        continue
-                    if url.rsplit(".", 1)[-1].lower() not in ("jpg", "jpeg", "png", "webp"):
-                        continue
-                    try:
-                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                            if r.status == 200:
-                                images.append(await r.read())
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[添老婆] Yande.re 拉图失败: %s" % e)
-        return images
-
-    async def _getchu_fetch(self, source_query: str, count: int) -> list[bytes]:
-        """Getchu 官方立绘抓取：搜索作品页，提取立绘/sample大图。
-        
-        流程：搜索页找商品ID → 商品页抓立绘URL → 下载过滤小图
-        立绘通常在 bodypaint/chara/sample 路径，20KB以上才算有效图。
-        """
-        images = []
-        try:
-            from curl_cffi.requests import AsyncSession
-
-            search_url = (
-                "https://www.getchu.com/php/search.phtml"
-                f"?search_keyword={quote(source_query)}&genre=pc_soft&search=search"
-            )
-            async with AsyncSession() as s:
-                # 1. 搜索作品，取第一个结果的商品ID
-                r = await s.get(
-                    search_url,
-                    impersonate="chrome120",
-                    headers={"Accept-Language": "ja,en;q=0.9", "Referer": "https://www.getchu.com/"},
-                    timeout=20,
-                    allow_redirects=True,
-                )
-                if r.status_code != 200:
-                    logger.warning("[添老婆][Getchu] 搜索HTTP %d" % r.status_code)
-                    return []
-
-                product_ids = re.findall(r"soft\.phtml\?id=(\d+)", r.text)
-                if not product_ids:
-                    logger.info("[添老婆][Getchu] 未找到作品: %r" % source_query)
-                    return []
-                pid = product_ids[0]
-                logger.info("[添老婆][Getchu] 找到商品ID: %s" % pid)
-
-                # 2. 商品页抓立绘/sample图URL
-                r2 = await s.get(
-                    f"https://www.getchu.com/soft.phtml?id={pid}&gc=gc",
-                    impersonate="chrome120",
-                    headers={"Accept-Language": "ja,en;q=0.9", "Referer": "https://www.getchu.com/"},
-                    timeout=20,
-                    allow_redirects=True,
-                )
-                if r2.status_code != 200:
-                    return []
-
-                page = r2.text
-                # 抓所有 getchu 域名下的图片，包含 bodypaint/chara/sample/brandnew 关键路径
-                raw_urls = re.findall(
-                    r'["\']((https?:)?//(?:www|img)\.getchu\.com/[^"\']+\.(?:jpg|png))["\']',
-                    page, re.I
-                )
-                seen: set = set()
-                full_urls = []
-                for groups in raw_urls:
-                    u = groups[0]
-                    full = ("https:" + u) if u.startswith("//") else u
-                    # 优先立绘相关路径
-                    is_chara = any(k in full.lower() for k in ("bodypaint", "chara", "sample", "brandnew"))
-                    if full not in seen and is_chara:
-                        seen.add(full)
-                        full_urls.append(full)
-                # 补充非立绘路径（兜底）
-                for groups in raw_urls:
-                    u = groups[0]
-                    full = ("https:" + u) if u.startswith("//") else u
-                    if full not in seen:
-                        seen.add(full)
-                        full_urls.append(full)
-
-                logger.info("[添老婆][Getchu] 找到图片URL %d个" % len(full_urls))
-
-            # 3. 下载，过滤小图（< 20KB 视为缩略图）
-            async with aiohttp.ClientSession() as sess:
-                for url in full_urls:
-                    if len(images) >= count:
-                        break
-                    try:
-                        async with sess.get(
-                            url,
-                            headers={"Referer": "https://www.getchu.com/"},
-                            timeout=aiohttp.ClientTimeout(total=20),
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.read()
-                                if len(data) > 20 * 1024:
-                                    images.append(data)
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[添老婆] Getchu 拉图失败: %s" % e)
-        return images
-
-    async def _vndb_fetch(self, char_name: str, source: str, count: int) -> list[bytes]:
-        """VNDB API 角色图抓取。
-        
-        使用 VNDB HTTP API v2（无需认证）：
-        POST https://api.vndb.org/kana/character
-        按角色名模糊搜索，可选用 vn 过滤缩小范围，取 image.url 下载。
-        图片分辨率较低（通常 256x368），但冷门 galgame 角色在此覆盖最全。
-        """
-        images = []
-        try:
-            # 构建查询 filter：角色名搜索，可选附加作品名过滤
-            # VNDB filter 语法: ["and", ["search", "=", name], ...]
-            filters = ["search", "=", char_name]
-
-            payload = {
-                "filters": filters,
-                "fields": "name, image.url, image.sexual, vns.title",
-                "sort": "searchrank",
-                "results": min(count * 4, 20),
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    "https://api.vndb.org/kana/character",
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "astrbot_plugin_animewifex/1.0",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as r:
-                    if r.status != 200:
-                        logger.warning("[添老婆][VNDB] HTTP %d char=%r" % (r.status, char_name))
-                        return []
-                    data = await r.json()
-
-            results = data.get("results") or []
-            logger.info("[添老婆][VNDB] char=%r 返回%d条" % (char_name, len(results)))
-
-            # 过滤：sexual >= 2 (explicit) 的图跳过；优先匹配作品名
-            def _score(item: dict) -> int:
-                sc = 0
-                vns = item.get("vns") or []
-                if source:
-                    for vn in vns:
-                        if source.lower() in (vn.get("title") or "").lower():
-                            sc += 10
-                            break
-                img = item.get("image") or {}
-                if img.get("url"):
-                    sc += 1
-                return sc
-
-            results = [r for r in results if (r.get("image") or {}).get("url")]
-            results = [r for r in results if ((r.get("image") or {}).get("sexual") or 0) < 2]
-            results.sort(key=_score, reverse=True)
-
-            async with aiohttp.ClientSession() as s:
-                for item in results:
-                    if len(images) >= count:
-                        break
-                    url = (item.get("image") or {}).get("url")
-                    if not url:
-                        continue
-                    try:
-                        async with s.get(
-                            url,
-                            headers={"User-Agent": "astrbot_plugin_animewifex/1.0"},
-                            timeout=aiohttp.ClientTimeout(total=20),
-                        ) as resp:
-                            if resp.status == 200:
-                                data_bytes = await resp.read()
-                                if len(data_bytes) > 5 * 1024:  # VNDB图较小，5KB起步即可
-                                    images.append(data_bytes)
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[添老婆] VNDB 拉图失败: %s" % e)
-        return images
-
-    async def _dlsite_cover_fetch(self, source_query: str, count: int) -> list[bytes]:
-        """DLsite 封面图终极保底：按作品名搜索，抓封面图"""
-        images = []
-        try:
-            from curl_cffi.requests import AsyncSession
-
-            async def _get_cover_urls(site: str) -> list[str]:
-                url = (
-                    f"https://www.dlsite.com/{site}/fsr/=/language/jp"
-                    f"/keyword/{quote(source_query)}/order/trend/per_page/5"
-                )
-                async with AsyncSession() as sess:
-                    r = await sess.get(
-                        url, impersonate="chrome120",
-                        headers={"Accept-Language": "ja,en;q=0.9", "Referer": "https://www.dlsite.com/"},
-                        timeout=20, allow_redirects=True,
-                    )
-                    if r.status_code != 200:
-                        return []
-                    imgs = re.findall(r'src="(//img\.dlsite\.jp/[^"]+\.jpg)"', r.text)
-                    return ["https:" + u for u in imgs[:count * 2]]
-
-            cover_urls = []
-            for site in ("maniax", "girls"):
-                cover_urls.extend(await _get_cover_urls(site))
-            # 去重
-            seen: set = set()
-            cover_urls = [u for u in cover_urls if not (u in seen or seen.add(u))]  # type: ignore
-            logger.info("[添老婆][DLsite封面] query=%r 封面URL %d个" % (source_query, len(cover_urls)))
-
-            async with aiohttp.ClientSession() as s:
-                for url in cover_urls:
-                    if len(images) >= count:
-                        break
-                    try:
-                        async with s.get(
-                            url,
-                            headers={"Referer": "https://www.dlsite.com/"},
-                            timeout=aiohttp.ClientTimeout(total=20),
-                        ) as r:
-                            if r.status == 200:
-                                images.append(await r.read())
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[添老婆] DLsite封面拉图失败: %s" % e)
-        return images
-
-
-    async def _custom_source_fetch(self, source_name: str, query: str, count: int) -> list[bytes]:
-        """自定义图源分发入口。source_name 为 extra_image_sources 中配置的图源名（小写）。
-        新增图源时在此处加一个 elif 分支即可。
-        """
-        source_name = source_name.strip().lower()
-
-        if source_name == "lolicon":
-            return await self._lolicon_fetch(query, count)
-
-        # ── 待扩展图源 ──────────────────────────────────────────────────────
-        # elif source_name == "zerochan":
-        #     return await self._zerochan_fetch(query, count)
-        # elif source_name == "animepictures":
-        #     return await self._animepictures_fetch(query, count)
-        # ────────────────────────────────────────────────────────────────────
-
-        else:
-            logger.warning("[添老婆][自定义图源] 未知图源名: %r，跳过" % source_name)
-            return []
-
-    async def _lolicon_fetch(self, query: str, count: int) -> list[bytes]:
-        """lolicon API 拉图（api.lolicon.app），rating=0 仅全年龄，按关键词搜索。
-        API 文档：https://api.lolicon.app/#/setu
-        """
-        images = []
-        try:
-            params = {
-                "keyword": query,
-                "r18": 0,           # 0 = 仅全年龄
-                "num": min(count * 2, 20),
-                "size": ["original", "regular"],
-            }
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    "https://api.lolicon.app/setu/v2",
-                    json=params,
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as r:
-                    if r.status != 200:
-                        logger.warning("[添老婆][lolicon] HTTP %d query=%r" % (r.status, query))
-                        return []
-                    data = await r.json()
-
-            items = data.get("data") or []
-            logger.info("[添老婆][lolicon] query=%r 返回%d条" % (query, len(items)))
-
-            async with aiohttp.ClientSession() as s:
-                for item in items:
-                    if len(images) >= count:
-                        break
-                    urls = item.get("urls") or {}
-                    url = urls.get("original") or urls.get("regular")
-                    if not url:
-                        continue
-                    try:
-                        async with s.get(
-                            url,
-                            headers={"Referer": "https://www.pixiv.net/"},
-                            timeout=aiohttp.ClientTimeout(total=20),
-                        ) as r:
-                            if r.status == 200:
-                                img_data = await r.read()
-                                if len(img_data) > 10 * 1024:
-                                    images.append(img_data)
-                    except Exception:
-                        continue
-        except Exception as e:
-            logger.error("[添老婆] lolicon 拉图失败: %s" % e)
-        return images
-
-    async def _pixiv_fetch(self, query: str, count: int) -> list[bytes]:
-        """Pixiv 搜索角色图片（全年龄）"""
-        images = []
-        try:
-            from pixivpy3 import AppPixivAPI
-            api = AppPixivAPI()
-            await asyncio.get_event_loop().run_in_executor(
-                None, api.auth, None, None, self.pixiv_refresh_token
-            )
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: api.search_illust(
-                    query,
-                    search_target="partial_match_for_tags",
-                    filter="for_ios",
-                )
-            )
-            posts = result.illusts or []
-            # 只取全年龄
-            posts = [p for p in posts if getattr(p, "x_restrict", 1) == 0]
-            # 按收藏数降序，优先取人气高的图
-            posts.sort(key=lambda p: getattr(p, "total_bookmarks", 0), reverse=True)
-            logger.info("[添老婆][Pixiv] query=%r 返回%d条(全年龄，按收藏数排序)" % (query, len(posts)))
-
-            async with aiohttp.ClientSession() as s:
-                for post in posts:
-                    if len(images) >= count:
-                        break
-                    try:
-                        url = post.image_urls.get("large") or post.image_urls.get("medium")
-                        if not url:
-                            continue
-                        async with s.get(
-                            url,
-                            headers={"Referer": "https://www.pixiv.net/"},
-                            timeout=aiohttp.ClientTimeout(total=20)
-                        ) as r:
-                            if r.status == 200:
-                                images.append(await r.read())
-                    except Exception:
-                        continue
-        except ImportError:
-            logger.warning("[添老婆] pixivpy3 未安装，跳过 Pixiv 拉图")
-        except Exception as e:
-            logger.error(f"[添老婆] Pixiv 拉图失败: {e}")
-        return images
-
-    async def _konachan_fetch(self, query: str, count: int) -> list[bytes]:
-        """Konachan safe 图片拉取"""
-        images = []
-        try:
-            params = {"tags": f"{query} rating:safe", "limit": count * 3, "page": 1}
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://konachan.com/post.json",
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as r:
-                    if r.status != 200:
-                        return []
-                    posts = await r.json()
-
-            random.shuffle(posts)
-            for post in posts:
-                if len(images) >= count:
-                    break
-                url = post.get("sample_url") or post.get("jpeg_url") or post.get("file_url")
-                if not url:
-                    continue
-                try:
-                    async with aiohttp.ClientSession() as s:
-                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                            if r.status == 200:
-                                images.append(await r.read())
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.error(f"[添老婆] Konachan 拉图失败: {e}")
-        return images
-
-    async def _danbooru_fetch(self, query: str, count: int) -> list[bytes]:
-        """Danbooru safe 图片拉取（无需认证，最多100条）"""
-        images = []
-        try:
-            params = {"tags": f"{query} rating:general", "limit": min(count * 3, 20), "page": 1}
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "https://danbooru.donmai.us/posts.json",
-                    params=params,
-                    headers={"User-Agent": "astrbot_plugin_animewifex/1.0"},
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as r:
-                    if r.status != 200:
-                        logger.warning("[添老婆][Danbooru] HTTP %d query=%r" % (r.status, query))
-                        return []
-                    posts = await r.json()
-
-            logger.info("[添老婆][Danbooru] query=%r 返回%d条" % (query, len(posts)))
-            random.shuffle(posts)
-            for post in posts:
-                if len(images) >= count:
-                    break
-                url = post.get("large_file_url") or post.get("file_url")
-                if not url:
-                    continue
-                ext = url.rsplit(".", 1)[-1].lower()
-                if ext not in ("jpg", "jpeg", "png", "webp"):
-                    continue
-                try:
-                    async with aiohttp.ClientSession() as s:
-                        async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                            if r.status == 200:
-                                images.append(await r.read())
-                except Exception:
-                    continue
-        except Exception as e:
-            logger.error(f"[添老婆] Danbooru 拉图失败: {e}")
-        return images
-
     def _get_img_dir(self, source: str) -> str:
-        """根据 list.txt 判断作品应放哪个 img 目录（img1 已满，强制不再写入）"""
-        list_txt = os.path.join(CONFIG_DIR, "list_cache.txt")
-
-        if os.path.exists(list_txt):
-            try:
-                with open(list_txt, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        m = re.match(r'^(img\d+)/', line)
-                        if not m:
-                            continue
-                        img_dir = m.group(1)
-                        if img_dir == "img1":
-                            continue  # img1 已满，强制跳过
-                        rest = line[len(img_dir) + 1:]
-                        if "!" in rest:
-                            src = rest.split("!", 1)[0]
-                            if src == source:
-                                return img_dir
-            except Exception:
-                pass
-        return random.choice(["img2", "img3"])
+        return self.github_publisher.get_img_dir(source)
 
     @staticmethod
     def _detect_img_ext(data: bytes) -> str:
-        """根据 magic bytes 检测图片格式，返回扩展名（含点）"""
-        if data[:8] == b'\x89PNG\r\n\x1a\n':
-            return ".png"
-        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
-            return ".webp"
-        if data[:3] == b'GIF':
-            return ".gif"
-        if data[:4] == b'\x00\x00\x01\x00':
-            return ".ico"
-        if data[:2] == b'BM':
-            return ".bmp"
-        # JPEG: FFD8FF（覆盖 jpg 和 jpeg）
-        if data[:3] == b'\xff\xd8\xff':
-            return ".jpg"
-        # 默认当 jpg
-        return ".jpg"
+        return GitHubPublisher.detect_img_ext(data)
 
     async def _create_github_pr_empty(self, source: str, char_name: str, img_dir: str) -> str | None:
-        """创建不含图片的空 PR，供手动上传"""
-        token = self.github_token
-        repo = self.github_repo
-        branch = self.github_branch
-        if not token:
-            return None
-
-        safe_source = re.sub(r'[\\/:*?"<>|]', '_', source)
-        safe_char = re.sub(r'[\\/:*?"<>|]', '_', char_name)
-        filename = f"{img_dir}/{safe_source}!{safe_char}.jpg" if safe_source else f"{img_dir}/{safe_char}.jpg"
-
-        # 用英文名生成分支名和占位文件名，避免韩文/中文等非ASCII字符导致GitHub API报错
-        en_cache = load_json(EN_CACHE_FILE)
-        en_name = en_cache.get(char_name, {}).get("en", "") if isinstance(en_cache.get(char_name), dict) else en_cache.get(char_name, "")
-        branch_char = en_name if en_name else char_name
-        safe_branch_char = re.sub(r'[^a-zA-Z0-9]', '-', branch_char[:20])
-        pr_branch = f"add-char-{safe_branch_char}-{random.randint(1000,9999)}"
-        # 占位文件名也用英文，避免非ASCII
-        placeholder_name = f".placeholder_{safe_branch_char}"
-
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        base_url = f"https://api.github.com/repos/{repo}"
-        logger.info(f"[添老婆] 开始创建空PR: branch={pr_branch} filename={filename}")
-
-        try:
-            async with aiohttp.ClientSession(headers=headers) as s:
-                async with s.get(f"{base_url}/git/ref/heads/{branch}") as r:
-                    if r.status != 200:
-                        logger.error(f"[添老婆] 步骤1 获取SHA失败: {r.status} {await r.text()}")
-                        return None
-                    main_sha = (await r.json())["object"]["sha"]
-                    logger.info(f"[添老婆] 步骤1 获取SHA成功: {main_sha[:8]}")
-
-                async with s.post(f"{base_url}/git/refs", json={
-                    "ref": f"refs/heads/{pr_branch}",
-                    "sha": main_sha,
-                }) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 步骤2 创建分支失败: {r.status} {await r.text()}")
-                        return None
-                    logger.info(f"[添老婆] 步骤2 创建分支成功: {pr_branch}")
-
-                # 上传一个占位文件
-                import base64 as b64
-                placeholder = b64.b64encode(
-                    f"请在此目录上传图片：{filename}".encode()
-                ).decode()
-                async with s.put(f"{base_url}/contents/{img_dir}/{placeholder_name}", json={
-                    "message": f"Add: {source}!{char_name} (需手动上传图片)",
-                    "content": placeholder,
-                    "branch": pr_branch,
-                }) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 步骤3 上传占位文件失败: {r.status} {await r.text()}")
-                        return None
-                    logger.info(f"[添老婆] 步骤3 上传占位文件成功")
-
-                # 空PR也预写 list.txt，上传图片后 merge 就完成
-                list_path = "list.txt"
-                list_sha = None
-                list_content_old = ""
-                import base64 as _b64
-                async with s.get(f"{base_url}/contents/{list_path}", params={"ref": pr_branch}) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        list_sha = data.get("sha")
-                        list_content_old = _b64.b64decode(data["content"].replace("\n","")).decode("utf-8")
-                    logger.info(f"[添老婆] 步骤4 读取list.txt: status={r.status}")
-
-                list_content_new = list_content_old.rstrip("\n") + "\n" + filename + "\n"
-                lines_sorted = sorted(set(l for l in list_content_new.splitlines() if l.strip()))
-                list_content_new = "\n".join(lines_sorted) + "\n"
-                list_encoded = _b64.b64encode(list_content_new.encode("utf-8")).decode()
-                put_body = {
-                    "message": f"Auto: update list.txt for {source}!{char_name}",
-                    "content": list_encoded,
-                    "branch": pr_branch,
-                }
-                if list_sha:
-                    put_body["sha"] = list_sha
-                async with s.put(f"{base_url}/contents/{list_path}", json=put_body) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 步骤5 更新list.txt失败: {r.status} {await r.text()}")
-                    else:
-                        logger.info(f"[添老婆] 步骤5 更新list.txt成功")
-
-                body = (
-                    f"新增角色：{source} - {char_name}\n\n"
-                    f"⚠️ 自动拉图失败，请手动上传图片到分支 `{pr_branch}` 的以下路径：\n"
-                    f"- `{filename}`\n\n"
-                    f"上传图片后直接 merge 即可，list.txt 已预先更新。"
-                )
-                async with s.post(f"{base_url}/pulls", json={
-                    "title": f"Add: {source}!{char_name}",
-                    "head": pr_branch,
-                    "base": branch,
-                    "body": body,
-                }) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 步骤6 创建PR失败: {r.status} {await r.text()}")
-                        return None
-                    pr_url = (await r.json()).get("html_url")
-                    logger.info(f"[添老婆] 步骤6 PR创建成功: {pr_url}")
-                    return pr_url
-        except Exception as e:
-            logger.error(f"[添老婆] 创建空PR异常: {e}", exc_info=True)
-            return None
+        """Create a manual-upload PR through the GitHub publisher service."""
+        return await self.github_publisher.create_empty_pr(source, char_name, img_dir)
 
     async def _create_github_pr(
         self, source: str, char_name: str, img_dir: str, images: list[bytes]
     ) -> str | None:
-        """通过 GitHub API 创建 PR"""
-        import base64 as b64
-        token = self.github_token
-        repo = self.github_repo
-        branch = self.github_branch
-
-        if not token or not images:
-            return None
-
-        # 生成文件名（同一角色多张图加 _2 _3 后缀）
-        safe_source = re.sub(r'[\\/:*?"<>|]', '_', source)
-        safe_char = re.sub(r'[\\/:*?"<>|]', '_', char_name)
-        base = f"{safe_source}!{safe_char}" if safe_source else safe_char
-        file_names = []
-        for i, img_data in enumerate(images):
-            suffix = "" if i == 0 else f"_{i + 1}"
-            ext = self._detect_img_ext(img_data)
-            file_names.append(f"{img_dir}/{base}{suffix}{ext}")
-        logger.info("[添老婆] 生成文件名: %s" % file_names)
-
-        pr_branch = f"add-char-{re.sub(r'[^a-zA-Z0-9]', '-', char_name[:20])}-{random.randint(1000, 9999)}"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        base_url = f"https://api.github.com/repos/{repo}"
-
-        try:
-            async with aiohttp.ClientSession(headers=headers) as s:
-                # 1. 获取 main SHA
-                async with s.get(f"{base_url}/git/ref/heads/{branch}") as r:
-                    if r.status != 200:
-                        logger.error(f"[添老婆] 获取分支 SHA 失败: {r.status}")
-                        return None
-                    ref_data = await r.json()
-                main_sha = ref_data["object"]["sha"]
-
-                # 2. 创建新分支
-                async with s.post(f"{base_url}/git/refs", json={
-                    "ref": f"refs/heads/{pr_branch}",
-                    "sha": main_sha,
-                }) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 创建分支失败: {r.status}")
-                        return None
-
-                # 3. 上传图片
-                for fname, img_data in zip(file_names, images):
-                    img_content = b64.b64encode(img_data).decode()
-                    async with s.put(f"{base_url}/contents/{fname}", json={
-                        "message": f"Add: {source}!{char_name}",
-                        "content": img_content,
-                        "branch": pr_branch,
-                    }) as r:
-                        if r.status not in (200, 201):
-                            logger.error(f"[添老婆] 上传图片失败: {fname} {r.status}")
-                            await s.delete(f"{base_url}/git/refs/heads/{pr_branch}")
-                            return None
-
-                # 4. 更新 list.txt（直接写入，不依赖 Actions）
-                list_path = "list.txt"
-                list_sha = None
-                list_content_old = ""
-                async with s.get(f"{base_url}/contents/{list_path}", params={"ref": pr_branch}) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        list_sha = data.get("sha")
-                        import base64 as _b64
-                        list_content_old = _b64.b64decode(data["content"].replace("\n","")).decode("utf-8")
-
-                new_entries = "\n".join(file_names)
-                list_content_new = list_content_old.rstrip("\n") + "\n" + new_entries + "\n"
-                # 去重排序
-                lines_sorted = sorted(set(l for l in list_content_new.splitlines() if l.strip()))
-                list_content_new = "\n".join(lines_sorted) + "\n"
-                list_encoded = b64.b64encode(list_content_new.encode("utf-8")).decode()
-
-                put_body = {
-                    "message": f"Auto: update list.txt for {source}!{char_name}",
-                    "content": list_encoded,
-                    "branch": pr_branch,
-                }
-                if list_sha:
-                    put_body["sha"] = list_sha
-                async with s.put(f"{base_url}/contents/{list_path}", json=put_body) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 更新 list.txt 失败: {r.status}")
-                        # 不中断，继续创建 PR
-
-                # 5. 创建 PR
-                body_lines = [
-                    f"新增角色图片：{source} - {char_name}", "",
-                ] + [f"- `{f}`" for f in file_names] + [
-                    "", "merge 后 list.txt 已同步更新，无需额外操作。"
-                ]
-                async with s.post(f"{base_url}/pulls", json={
-                    "title": f"Add: {source}!{char_name}",
-                    "head": pr_branch,
-                    "base": branch,
-                    "body": "\n".join(body_lines),
-                }) as r:
-                    if r.status not in (200, 201):
-                        logger.error(f"[添老婆] 创建 PR 失败: {r.status}")
-                        return None
-                    pr_data = await r.json()
-                    return pr_data.get("html_url")
-        except Exception as e:
-            logger.error(f"[添老婆] GitHub API 异常: {e}")
-            return None
+        """Create an image PR through the GitHub publisher service."""
+        return await self.github_publisher.create_pr(source, char_name, img_dir, images)
 
     async def _notify_group(self, gid: str, text: str):
         """向群发送纯文本通知"""
@@ -3489,6 +2713,8 @@ query ($search: String) {
 
     async def terminate(self):
         """插件卸载时清理资源"""
+        if _drawn_pool_dirty:
+            save_drawn_pool()
         config_locks.clear()
         records.clear()
         swap_requests.clear()

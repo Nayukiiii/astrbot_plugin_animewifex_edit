@@ -47,13 +47,19 @@ class HentaiSearcher:
     可在任意 asyncio 环境中独立使用。
     """
 
-    def __init__(self, config: dict, en_cache_fn=None, en_cache_write_fn=None):
+    def __init__(
+        self, config: dict,
+        en_cache_fn=None, en_cache_write_fn=None,
+        trans_cache_fn=None, trans_cache_write_fn=None,
+    ):
         self.jm_base            = config.get("jm_base_url",  "https://18comic.vip").rstrip("/")
         self.nh_base            = config.get("nh_base_url",  "https://nhentai.net").rstrip("/")
         self.nvidia_api_key     = config.get("nvidia_api_key", "")
         self.nvidia_model       = config.get("nvidia_model",   "meta/llama-3.3-70b-instruct")
         self._en_cache_fn       = en_cache_fn
         self._en_cache_write_fn = en_cache_write_fn
+        self._trans_cache_fn       = trans_cache_fn
+        self._trans_cache_write_fn = trans_cache_write_fn
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -374,7 +380,18 @@ class HentaiSearcher:
 
     async def _ai_translate_multi(self, char: str, source: str = "") -> dict:
         """调用 NVIDIA NIM LLM 取多语言信息。无 Key 时直接返回空 dict。"""
-        if not char or not self.nvidia_api_key:
+        if not char:
+            return {}
+
+        if self._trans_cache_fn:
+            try:
+                cached = self._trans_cache_fn(char, source) or {}
+                if isinstance(cached, dict) and cached.get("en_char"):
+                    return cached
+            except Exception:
+                pass
+
+        if not self.nvidia_api_key:
             return {}
 
         subject = f"角色名：{char}"
@@ -436,12 +453,43 @@ class HentaiSearcher:
                         result = json.loads(text)
                         if not isinstance(result.get("alt_char"), list):
                             result["alt_char"] = []
+                        self._normalize_translation_result(result)
+                        if self._trans_cache_write_fn:
+                            try:
+                                self._trans_cache_write_fn(char, source, result)
+                            except Exception:
+                                pass
                         return result
                     else:
                         logger.warning(f"[查本子] NV API 状态码: {r.status}")
         except Exception as e:
             logger.warning(f"[查本子] NV翻译失败: {e}")
         return {}
+
+    @staticmethod
+    def _normalize_translation_result(result: dict) -> None:
+        """补齐翻译结果字段，避免调用方各自猜默认值。"""
+        defaults = {
+            "zh_char": "",
+            "en_char": "",
+            "ja_char": "",
+            "kana_char": "",
+            "alt_char": [],
+            "en_source": "",
+            "ja_source": "",
+            "short_source": "",
+            "is_vtuber": False,
+        }
+        for key, default in defaults.items():
+            if key not in result or result[key] is None:
+                result[key] = default
+        if not isinstance(result.get("alt_char"), list):
+            result["alt_char"] = []
+        result["alt_char"] = list(dict.fromkeys(
+            str(x).strip() for x in result.get("alt_char", []) if str(x).strip()
+        ))
+        for key in ("zh_char", "en_char", "ja_char", "kana_char", "en_source", "ja_source", "short_source"):
+            result[key] = str(result.get(key, "")).strip()
 
     # ------------------------------------------------------------------
     # 内部：相关性挑选
