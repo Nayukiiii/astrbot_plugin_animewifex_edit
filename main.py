@@ -304,7 +304,11 @@ class WifePlugin(Star):
             ],
             "base_prob" : self.config.get("karma_base_prob", 0.15),
             "max_prob"  : self.config.get("karma_max_prob", 0.80),
-            "up_chars"  : [s.strip() for s in self.config.get("up_chars", "").split(",") if s.strip()],
+            "up_chars"  : [
+                s.strip()
+                for s in (self.config.get("up_chars", "") or self.config.get("up_char", "")).split(",")
+                if s.strip()
+            ],
             "up_prob"   : self.config.get("up_prob", 0.10),
             "lock_chars"  : [s.strip() for s in self.config.get("lock_char", "").split(",") if s.strip()],
             "up_pool"       : [],
@@ -355,7 +359,7 @@ class WifePlugin(Star):
             punishment_imgs = punishment_imgs,
             base_prob   = _get("base_prob",  0.15),
             max_prob    = _get("max_prob",   0.80),
-            up_chars    = _get("up_chars",   []),
+            up_chars    = _get("up_chars",   gcfg.get("up_char", [])),
             up_prob     = _get("up_prob",    0.10),
             lock_chars   = _get("lock_chars",   []),
             up_pool      = _get("up_pool",      []),

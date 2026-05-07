@@ -167,11 +167,11 @@
         "default": 0.8,
         "hint": "业力惩罚触发概率的最高值。取值范围 [0, 1]"
     },
-    "up_char": {
-        "description": "UP 池角色图片路径（全局默认）",
+    "up_chars": {
+        "description": "单角色 UP 池图片路径（全局默认）",
         "type": "string",
         "default": "",
-        "hint": "list.txt 中的相对路径，抽老婆时有 up_prob 概率强制抽到此角色。留空则不启用。各群可在 karma_groups.json 中单独覆盖"
+        "hint": "list.txt 中的相对路径，最多两张，用英文逗号分隔，抽老婆时有 up_prob 概率随机选一张出货。留空则不启用。各群可在 karma_groups.json 中单独覆盖"
     },
     "up_prob": {
         "description": "UP 池触发概率（全局默认）",

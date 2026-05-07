@@ -9,13 +9,13 @@ karma.py — 业力系统
   - 概率 = min(karma_count × base_prob, max_prob)
   - 业力计数每日清零（UTC+8）
 
-功能二：UP 池
-  - 抽老婆时以 up_prob 概率强制抽到 up_char 指定角色
-  - up_char / up_prob 均写在 config 中
+功能二：单角色 UP 池
+  - 抽老婆时以 up_prob 概率从 up_chars 列表（最多两张）中随机选一张
+  - up_chars / up_prob 均写在 config 中
 
 功能三：换老婆锁定
   - 当天抽到 lock_chars 列表中任意角色后，当天禁止换老婆
-  - lock_chars 与 up_char 独立配置
+  - lock_chars 与 up_chars 独立配置
 
 功能四：常驻 UP 池
   - 抽老婆时以 up_pool_prob 概率从 up_pool 列表中随机选一张
@@ -61,10 +61,10 @@ class KarmaSystem:
         每点业力增加的触发概率，默认 0.15（15%）。
     max_prob : float
         触发概率上限，默认 0.80（80%）。
-    up_char : str
-        UP 池角色路径（list.txt 中的相对路径）。为空则 UP 池不生效。
+    up_chars : list[str]
+        单角色 UP 池路径列表（list.txt 中的相对路径），最多两张随机选一张。为空则不生效。
     up_prob : float
-        UP 池触发概率，默认 0.10（10%）。
+        单角色 UP 池触发概率，默认 0.10（10%）。
     lock_chars : list[str]
         换老婆锁定角色路径列表（list.txt 中的相对路径）。
         当天抽到列表中任意一张后禁止换老婆。为空则锁定功能不生效。
@@ -77,6 +77,7 @@ class KarmaSystem:
         punishment_imgs: list[str],
         base_prob: float = 0.15,
         max_prob: float = 0.80,
+        up_chars: list[str] | None = None,
         up_char: str = "",
         up_prob: float = 0.10,
         lock_chars: list[str] | None = None,
@@ -87,7 +88,10 @@ class KarmaSystem:
         self.punishment_imgs = [img for img in punishment_imgs if img]
         self.base_prob       = base_prob
         self.max_prob        = max_prob
-        self.up_char         = up_char.strip()
+        self.up_chars        = [c.strip() for c in (up_chars or []) if c and c.strip()]
+        if up_char and up_char.strip():
+            self.up_chars.append(up_char.strip())
+        self.up_chars        = list(dict.fromkeys(self.up_chars))
         self.up_prob         = up_prob
         self.lock_chars      = [c.strip() for c in (lock_chars or []) if c and c.strip()]
         self.up_pool         = [c.strip() for c in (up_pool or []) if c and c.strip()]
@@ -163,22 +167,22 @@ class KarmaSystem:
     # ------------------------------------------------------------------
 
     def up_active(self) -> bool:
-        """UP 池功能是否已配置。"""
-        return bool(self.up_char) and self.up_prob > 0
+        """单角色 UP 池功能是否已配置。"""
+        return bool(self.up_chars) and self.up_prob > 0
 
     def roll_up(self) -> str | None:
         """
-        执行 UP 池判定（在「抽老婆」时调用，业力判定之后、正常抽取之前）。
+        执行单角色 UP 池判定（在「抽老婆」时调用，常驻 UP 池判定之后、正常抽取之前）。
 
         Returns
         -------
         str | None
-            触发时返回 up_char 路径，未触发时返回 None。
+            触发时从 up_chars 中随机返回一张路径，未触发时返回 None。
         """
         if not self.up_active():
             return None
         if _roll(self.up_prob):
-            return self.up_char
+            return secrets.choice(self.up_chars)
         return None
 
 
