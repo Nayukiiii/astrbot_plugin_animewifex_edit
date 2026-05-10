@@ -1701,7 +1701,8 @@ class WifePlugin(Star):
 
         page = filtered[offset: offset + 3]
 
-        # ── Step 4：有 hint_source 时过滤 source 不匹配的候选 ──────────
+        # ── Step 4：有 hint_source 时优先展示 source 匹配的候选 ──────────
+        _source_partial_match = False  # 是否为"source 不精确匹配"的候选列表
         if _hint_source and offset == 0:
             hint_low = _hint_source.strip().lower()
             def _src_hint_match(c: dict) -> bool:
@@ -1710,19 +1711,11 @@ class WifePlugin(Star):
             matched = [c for c in filtered if _src_hint_match(c)]
             if matched:
                 page = matched[:3]
-            else:
-                # 搜不到匹配候选 → 直接用用户输入构造虚拟候选提交
-                virtual = {"name": query, "source": _hint_source, "thumb_url": ""}
-                hit = await self._char_exists_in_list(query, source=_hint_source)
-                if hit:
-                    yield event.plain_result(f"「{query}」已经在老婆库里了哦~")
-                    return
-                await self._submit_pending(gid, uid, nick, virtual, umo=event.unified_msg_origin)
-                yield event.plain_result(
-                    f"未在数据库找到《{_hint_source}》的「{query}」，\n"
-                    f"已直接提交审核，等待管理员处理~"
-                )
-                return
+            elif filtered:
+                # 有候选但 source 不完全匹配 → 展示所有候选供用户确认，不直接提交
+                # 用户选定后 hint_source 会从 session 中覆盖候选的 source 字段
+                page = filtered[:3]
+                _source_partial_match = True
 
         if not page:
             if offset == 0:
@@ -1742,7 +1735,10 @@ class WifePlugin(Star):
             return
 
         # 发文字列表
-        lines = [f"找到以下角色，回复数字或角色名选择（{ADD_SESSION_TTL}秒内有效）："]
+        lines = []
+        if _source_partial_match:
+            lines.append(f"⚠️ 数据库未精确匹配《{_hint_source}》，以下为同名候选，选定后将以《{_hint_source}》提交：")
+        lines.append(f"找到以下角色，回复数字或角色名选择（{ADD_SESSION_TTL}秒内有效）：")
         for i, c in enumerate(page, 1):
             display_src = c.get('source') or _hint_source
             src = f"《{display_src}》" if display_src else "《来源不明》"
