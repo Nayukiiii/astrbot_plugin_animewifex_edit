@@ -133,14 +133,36 @@ class FavoritesService:
         return self.records.setdefault("favorites", {})
 
     def get_record(self, gid: str, uid: str) -> dict:
-        return self._bucket().setdefault(gid, {}).setdefault(
+        bucket = self._bucket()
+        grp = bucket.setdefault(gid, {})
+        rec = grp.setdefault(
             uid,
             {"chars": [], "set_at": "", "intro_seen": False, "tickets": 0},
         )
+        # 跨群继承：本群没设过（chars=[] 且 set_at=""）→ 用最近设过的群作为本命
+        # 让"本命"按账号生效，而不是按群。已设过/换过的群不再继承。
+        if not rec.get("chars") and not rec.get("set_at"):
+            best = None
+            for other_gid, users in bucket.items():
+                if other_gid == gid:
+                    continue
+                o = users.get(uid)
+                if o and o.get("chars"):
+                    if best is None or (o.get("set_at", "") or "") > (best.get("set_at", "") or ""):
+                        best = o
+            if best:
+                rec["chars"] = list(best.get("chars") or [])
+                rec["set_at"] = best.get("set_at", "")
+                rec["intro_seen"] = True
+                try:
+                    self.save_records_fn()
+                except Exception:
+                    pass
+        return rec
 
     def has_favorites(self, gid: str, uid: str) -> bool:
-        rec = self._bucket().get(gid, {}).get(uid, {})
-        return bool(rec.get("chars"))
+        # 走 get_record 以触发跨群继承
+        return bool(self.get_record(gid, uid).get("chars"))
 
     def intro_seen(self, gid: str, uid: str) -> bool:
         rec = self._bucket().get(gid, {}).get(uid, {})
@@ -232,7 +254,8 @@ class FavoritesService:
 
     # ----- 抽老婆时按概率出本命 -----
     def roll_favorite(self, gid: str, uid: str, drawn_pool: dict) -> str | None:
-        rec = self._bucket().get(gid, {}).get(uid, {})
+        # 走 get_record 触发跨群继承
+        rec = self.get_record(gid, uid)
         chars = [c for c in (rec.get("chars") or []) if c]
         if not chars or self.favorite_prob <= 0:
             return None
