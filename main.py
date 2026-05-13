@@ -495,7 +495,9 @@ class WifePlugin(Star):
             # 管理员
             "重置本命引导": self.admin_reset_favorite_intro,
             "发券": self.admin_grant_ticket,
+            "发卷": self.admin_grant_ticket,  # 兼容错别字
             "查券": self.admin_view_tickets,
+            "查卷": self.admin_view_tickets,  # 兼容错别字
             "加称号": self.admin_grant_title,
             "重置任务": self.admin_reset_quests,
             "清本命": self.admin_clear_favorites,
@@ -3578,12 +3580,18 @@ query ($search: String) {
 
     def _parse_admin_args(self, event: AstrMessageEvent, cmd: str) -> tuple[str, list[str]]:
         """从消息里拆出 @目标 uid 和剩余参数（按空格切）。
-        没有 @ 则 tid 为空字符串。
+        没有 @ 则 tid 为空字符串。cmd 可同时支持 券/卷 错别字。
         """
         tid = self.parse_at_target(event) or ""
         msg = event.message_str.strip()
-        if msg.startswith(cmd):
-            rest = msg[len(cmd):].strip()
+        # 支持 券/卷 通用前缀剥离
+        aliases = [cmd]
+        if "券" in cmd:
+            aliases.append(cmd.replace("券", "卷"))
+        for a in aliases:
+            if msg.startswith(a):
+                rest = msg[len(a):].strip()
+                break
         else:
             rest = msg
         # 去掉 @ 占位符（部分平台保留为 [CQ:at,qq=...] 或 "@昵称 "）
