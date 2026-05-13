@@ -958,10 +958,12 @@ class WifePlugin(Star):
         done = self.daily_quests.mark(gid, uid, "draw")
         for d in done:
             msgs.append(f"📜 完成任务：{d}")
-        # 作品图鉴完成检测
+        # 作品图鉴完成检测：奖励照发，但消息最多列 3 条避免刷屏
         new_works = self.works_album.check_completion(gid, uid)
-        for w in new_works:
+        for w in new_works[:3]:
             msgs.append(f"🏆 集齐《{w}》全角色！获得换本命券 ×1")
+        if len(new_works) > 3:
+            msgs.append(f"🏆 ...另外集齐了 {len(new_works) - 3} 部作品，各获换本命券 ×1")
         # 里程碑
         streak = int(stats.get("streak", 0) or 0)
         seen, total, pct = self.retention.album_summary(gid, uid)
