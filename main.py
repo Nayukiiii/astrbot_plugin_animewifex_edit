@@ -822,7 +822,18 @@ class WifePlugin(Star):
     async def _yield_wifepicker_link(self, event, gid: str, uid: str, nick: str, anime_img: str):
         """抽完二次元老婆后反向调 wifepicker 抽今日群友，并把消息追加输出。
         wifepicker 未加载或调用失败时静默跳过。
+        每个用户每天每群只联动一次（避免「换老婆」/重复抽老婆刷屏）。
         """
+        # 每日每人去重：解决 换老婆→animewife 重入 / 重复抽老婆 / 子命令复用 等场景刷屏
+        today = get_today()
+        cache = getattr(self, "_wp_link_today", None)
+        if not isinstance(cache, dict) or cache.get("date") != today:
+            cache = {"date": today, "keys": set()}
+            self._wp_link_today = cache
+        key = f"{gid}:{uid}"
+        if key in cache["keys"]:
+            logger.info(f"[联动] {key} 今日已联动过，跳过")
+            return
         _wp_main = self._find_wifepicker_module()
         if _wp_main is None:
             logger.info("[联动] sys.modules 里没找到 astrbot_plugin_wifepicker，未加载")
@@ -844,6 +855,7 @@ class WifePlugin(Star):
         # 恋爱绑定：直接展示伴侣
         partner_id = data.get("partner_id")
         if partner_id:
+            cache["keys"].add(key)
             text = (f"\n—— 群友老婆联动 ——\n"
                     f"💕 你与【{data.get('partner_name')}】今日恋爱绑定中，群友老婆固定为对方。")
             yield event.chain_result([Plain(text), Image.fromURL(data["avatar_url"])])
@@ -851,6 +863,7 @@ class WifePlugin(Star):
         wife_id = data.get("wife_id")
         if not wife_id:
             return
+        cache["keys"].add(key)
         td = data.get("tongdan")
         lines = ["", "—— 群友老婆联动 ——"]
         tag = "今日群友老婆（已抽）" if data.get("already_drawn") else "今日群友老婆"
