@@ -1,10 +1,18 @@
 """本命系统：用户挑 3 个本命，抽老婆时按 favorite_prob 概率优先出。
 
+引导流程（作品 → 角色）：
+  1) 输入「作品 关键词」搜本命的作品（按 list.txt 聚合）
+  2) 选定作品后列出该作品的角色，回数字选；超过 9 个分页
+  3) 选完一个回到「作品 关键词」搜下一个，直到 3 个或「跳过」
+  4) 搜不到的作品提示去用「添老婆」申请
+
 数据落在 records.json:
   favorites: {gid: {uid: {"chars": [...], "set_at": "YYYY-MM-DD", "intro_seen": bool, "tickets": int}}}
 
-会话临时数据走内存（不持久化即可）：
-  {gid: {uid: {"step": "...", "picked": [...], "candidates": [...], "expire_at": ts}}}
+会话临时数据走内存：
+  {gid: {uid: {"step": "picking", "mode": "work_search" | "char_search",
+              "picked": [...], "current_work": "...", "candidates": [...],
+              "char_pool": [...], "page": int, "kw": "", "expire_at": ts}}}
 """
 from __future__ import annotations
 
@@ -14,6 +22,87 @@ from datetime import datetime
 
 
 SESSION_TTL = 600  # 10 分钟
+PAGE_SIZE = 9
+
+
+def _display(img: str) -> str:
+    import os as _os
+    name = _os.path.splitext(img)[0].split("/")[-1]
+    if "!" in name:
+        src, ch = name.split("!", 1)
+        return f"《{src}》{ch}"
+    return name
+
+
+def _split(img: str) -> tuple[str, str]:
+    import os as _os
+    name = _os.path.splitext(img)[0].split("/")[-1]
+    if "!" in name:
+        s, c = name.split("!", 1)
+        return s, c
+    return "", name
+
+
+class WorksIndex:
+    """按作品聚合 list.txt 的索引：{source: [img, ...]}。
+
+    提供作品搜索（关键词模糊匹配 source 名 + 翻译别名）和角色枚举。
+    每次取 list_provider 重新构建，list.txt 缓存每小时刷新即可。
+    """
+
+    def __init__(self, list_provider, translation_get_fn=None):
+        self.list_provider = list_provider
+        self.translation_get_fn = translation_get_fn  # (char, source) -> profile dict or None
+
+    def _build(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for line in (self.list_provider() or []):
+            s, _ = _split(line)
+            if not s:
+                continue
+            out.setdefault(s, []).append(line)
+        return out
+
+    def search_works(self, kw: str) -> list[str]:
+        """匹配 source 名（原文 + 翻译别名）。返回 source 列表。"""
+        kw = (kw or "").strip().lower()
+        if not kw:
+            return []
+        works = self._build()
+        out = []
+        for src in works.keys():
+            if kw in src.lower():
+                out.append(src)
+                continue
+            # 用第一个角色的翻译档案的 source 别名匹配
+            if self.translation_get_fn:
+                chars = works[src]
+                if chars:
+                    _, first_char = _split(chars[0])
+                    profile = None
+                    try:
+                        profile = self.translation_get_fn(first_char, src)
+                    except Exception:
+                        profile = None
+                    if profile:
+                        aliases = [
+                            (profile.get("en_source") or ""),
+                            (profile.get("ja_source") or ""),
+                            (profile.get("short_source") or ""),
+                        ]
+                        if any(kw in a.lower() for a in aliases if a):
+                            out.append(src)
+        # 去重保序
+        seen, dedup = set(), []
+        for s in out:
+            if s not in seen:
+                seen.add(s)
+                dedup.append(s)
+        return dedup
+
+    def chars_of(self, source: str) -> list[str]:
+        """返回该作品下的所有 img 路径。"""
+        return list(self._build().get(source, []))
 
 
 class FavoritesService:
@@ -28,13 +117,15 @@ class FavoritesService:
         *,
         favorite_prob: float = 0.25,
         change_cooldown_days: int = 30,
+        translation_get_fn=None,
     ):
         self.records = records
-        self.list_provider = list_provider  # callable -> list[str] of valid img paths
+        self.list_provider = list_provider
         self.save_records_fn = save_records_fn
         self.get_today_fn = get_today_fn
         self.favorite_prob = float(favorite_prob or 0)
         self.change_cooldown_days = int(change_cooldown_days or 0)
+        self.works = WorksIndex(list_provider, translation_get_fn=translation_get_fn)
         self._sessions: dict = {}  # {gid: {uid: session_dict}}
 
     # ----- 存储 -----
@@ -88,8 +179,12 @@ class FavoritesService:
     def start_session(self, gid: str, uid: str) -> dict:
         s = {
             "step": "picking",
+            "mode": "work_search",
             "picked": [],
-            "candidates": [],
+            "current_work": "",
+            "candidates": [],   # 当前作品/角色列表 (img path 或 source 名)
+            "page": 0,
+            "kw": "",
             "expire_at": time.time() + SESSION_TTL,
         }
         self._sessions.setdefault(gid, {})[uid] = s
@@ -101,29 +196,14 @@ class FavoritesService:
     def touch_session(self, s: dict) -> None:
         s["expire_at"] = time.time() + SESSION_TTL
 
-    # ----- 搜索（仅在 list.txt 现有角色中搜） -----
+    # ----- 显示辅助 -----
     @staticmethod
     def _display(img: str) -> str:
-        import os as _os
-        name = _os.path.splitext(img)[0].split("/")[-1]
-        if "!" in name:
-            src, ch = name.split("!", 1)
-            return f"《{src}》{ch}"
-        return name
+        return _display(img)
 
-    def search(self, keyword: str, limit: int = 10) -> list[str]:
-        kw = (keyword or "").strip().lower()
-        if not kw:
-            return []
-        lines = self.list_provider() or []
-        out = []
-        for line in lines:
-            disp = self._display(line).lower()
-            if kw in disp or kw in line.lower():
-                out.append(line)
-                if len(out) >= limit:
-                    break
-        return out
+    @staticmethod
+    def _split(img: str):
+        return _split(img)
 
     # ----- 保存本命 -----
     def commit_picks(self, gid: str, uid: str, picks: list[str]) -> dict:
@@ -156,12 +236,10 @@ class FavoritesService:
         chars = [c for c in (rec.get("chars") or []) if c]
         if not chars or self.favorite_prob <= 0:
             return None
-        # 过滤 list.txt 里已不存在的
         all_lines = set(self.list_provider() or [])
         chars = [c for c in chars if c in all_lines]
         if not chars:
             return None
-        # 过滤去重池里已抽过的
         drawn = set(drawn_pool.get(gid, {}).get(uid, []))
         avail = [c for c in chars if c not in drawn]
         if not avail:

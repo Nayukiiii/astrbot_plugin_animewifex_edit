@@ -171,7 +171,9 @@ def run_engagement_suite() -> None:
     assert fav.session("g1", "u1") is not None
     fav.commit_picks("g1", "u1", ["A!a.jpg", "A!b.jpg"])
     assert fav.has_favorites("g1", "u1")
-    assert fav.search("a", limit=5)  # 找到 A!a / A!b / A!c
+    # 作品先行：通过 works 索引搜
+    assert "A" in fav.works.search_works("a")
+    assert fav.works.chars_of("A") == ["A!a.jpg", "A!b.jpg", "A!c.jpg"]
     # roll_favorite with prob=0 should return None
     assert fav.roll_favorite("g1", "u1", drawn_pool) is None
 

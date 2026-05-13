@@ -315,6 +315,7 @@ class WifePlugin(Star):
             get_today_fn=get_today,
             favorite_prob=self.favorite_prob,
             change_cooldown_days=self.favorite_change_cooldown_days,
+            translation_get_fn=self._get_translation_from_cache,
         )
         self.streak_freeze = StreakFreezeService(
             records,
@@ -560,10 +561,13 @@ class WifePlugin(Star):
         uid = str(event.get_sender_id())
         fav_session = self.favorites.session(gid, uid)
         if fav_session and fav_session.get("step") == "picking":
-            event.stop_event()
-            async for res in self._handle_favorite_session(event, fav_session, text):
-                yield res
-            return
+            fav_keywords = ("作品", "角色", "本命", "换一批", "返回", "跳过", "取消")
+            if text.startswith(fav_keywords) or text.isdigit():
+                event.stop_event()
+                async for res in self._handle_favorite_session(event, fav_session, text):
+                    yield res
+                return
+            # 其他文本不打断别的指令；用户随时可以发「取消」退出本命会话
 
         # 补签确认会话
         import time as _t_freeze
@@ -584,11 +588,10 @@ class WifePlugin(Star):
             async for res in self.add_wife(event):
                 yield res
             return
-        if session and session.get("step") == "waiting_input":
+        if session and session.get("step") == "waiting_confirm":
             import time as _t
             if session.get("expire_time", 0) > _t.time():
-                orig = session.get("query", "")
-                if text == "取消" or "/" in text or text == orig:
+                if text in ("确认", "取消") or text.startswith("改名") or text.startswith("改作品"):
                     event.stop_event()
                     async for res in self.add_wife(event):
                         yield res
@@ -596,7 +599,6 @@ class WifePlugin(Star):
             else:
                 add_sessions.get(gid, {}).pop(uid, None)
                 save_add_sessions()
-            # 过期或无关内容：继续正常分发
         if session and session.get("step") == "waiting_manual_source":
             import time as _t
             if session.get("expire_time", 0) > _t.time():
@@ -634,10 +636,11 @@ class WifePlugin(Star):
             if not records.get("draw_stats", {}).get(gid, {}).get(uid):
                 self.favorites.start_session(gid, uid)
                 yield event.plain_result(
-                    f"{nick}，欢迎入坑！先选 3 个本命，之后每次抽老婆有概率优先出她们。\n"
-                    f"请回复：本命 角色或作品关键词\n"
-                    f"（例如「本命 初音未来」或「本命 东方」）\n"
-                    f"不想选发「跳过」直接进入抽老婆。10 分钟内有效。"
+                    f"{nick}，欢迎入坑！来选 3 个本命，抽老婆有概率优先出她们。\n"
+                    f"先告诉我你喜欢的作品：\n"
+                    f"  回复：作品 作品名关键词（例：作品 原神 / 作品 东方）\n"
+                    f"没你要的作品就发：添老婆 角色名/作品名 直接申请。\n"
+                    f"想跳过：发「跳过」。10 分钟内有效。"
                 )
                 return
             else:
@@ -1791,7 +1794,7 @@ class WifePlugin(Star):
     # ==================== 添老婆相关 ====================
 
     async def add_wife(self, event: AstrMessageEvent):
-        """添老婆 - 搜索展示3个候选+小图，用户选择后提交审核"""
+        """添老婆 - 搜索 → 候选 → 提交确认（含中文化）→ 入队审核"""
         import time
         logger.info("[添老婆] add_wife 入口, msg=%r" % event.message_str)
         gid = str(event.message_obj.group_id)
@@ -1842,23 +1845,13 @@ class WifePlugin(Star):
             if hint_source:
                 chosen = dict(chosen)
                 chosen["source"] = hint_source
-            add_sessions[gid].pop(uid, None)
-            save_add_sessions()
 
-            src = f"《{chosen['source']}》" if chosen.get('source') else ""
-            # 最终选定时做一次完整模糊查重
-            hit = await self._char_exists_in_list(chosen["name"], source=chosen.get("source", ""))
-            if hit:
-                dup_name = hit if hit != chosen["name"] else chosen["name"]
-                yield event.plain_result(f"「{src}{chosen['name']}」已经在老婆库里了哦~（与「{dup_name}」重复）")
-                return
-
-            await self._submit_pending(gid, uid, nick, chosen, umo=event.unified_msg_origin)
-            yield event.plain_result(f"已提交「{src}{chosen['name']}」，等待管理员审核~")
+            async for r in self._enter_confirm_step(event, gid, uid, nick, chosen):
+                yield r
             return
 
-        # ── 等待补充作品名阶段 ──────────────────────────────────────────
-        if session and session.get("step") == "waiting_input":
+        # ── 提交确认阶段：确认 / 改名 X / 改作品 X / 取消 ────────────────
+        if session and session.get("step") == "waiting_confirm":
             if session.get("expire_time", 0) <= time.time():
                 add_sessions[gid].pop(uid, None)
                 save_add_sessions()
@@ -1868,22 +1861,34 @@ class WifePlugin(Star):
                 save_add_sessions()
                 yield event.plain_result("已取消~")
                 return
-            orig_query = session.get("query", "")
-            # 用户发了 角色名/作品名 → 带 source 搜
-            if "/" in msg:
-                char_part, source_part = msg.split("/", 1)
-                next_query = char_part.strip() or orig_query
-                hint_source = source_part.strip()
-            else:
-                # 用户直接再发一次角色名确认 → 无 source 搜索；其他内容忽略
-                if msg.strip() != orig_query:
-                    return  # 不是角色名也不是指令，忽略
-                next_query = orig_query
-                hint_source = ""
-            add_sessions[gid].pop(uid, None)
-            save_add_sessions()
-            async for res in self._do_search_and_show(event, gid, uid, nick, next_query, offset=0, _hint_source=hint_source):
-                yield res
+            if msg == "确认":
+                cand = session.get("candidate") or {}
+                add_sessions[gid].pop(uid, None)
+                save_add_sessions()
+                async for r in self._finalize_submission(event, gid, uid, nick, cand):
+                    yield r
+                return
+            if msg.startswith("改名"):
+                new_name = msg[2:].strip()
+                if not new_name:
+                    yield event.plain_result("用法：改名 中文名")
+                    return
+                session["candidate"]["name"] = new_name
+                session["expire_time"] = time.time() + ADD_SESSION_TTL
+                save_add_sessions()
+                yield event.plain_result(self._format_confirm_msg(session["candidate"]))
+                return
+            if msg.startswith("改作品"):
+                new_src = msg[3:].strip()
+                if not new_src:
+                    yield event.plain_result("用法：改作品 中文作品名")
+                    return
+                session["candidate"]["source"] = new_src
+                session["expire_time"] = time.time() + ADD_SESSION_TTL
+                save_add_sessions()
+                yield event.plain_result(self._format_confirm_msg(session["candidate"]))
+                return
+            # 其他文本忽略
             return
 
         # ── 数据库搜不到时：等待用户补作品名，直接送人工审核 ───────────────
@@ -1910,44 +1915,22 @@ class WifePlugin(Star):
                 "thumb_url": "",
                 "manual_reason": "角色搜索无结果，用户补作品名后送审",
             }
-            hit = await self._char_exists_in_list(query, source=source)
-            if hit:
-                yield event.plain_result(f"「{query}」已经在老婆库里了哦~（与「{hit}」重复）")
-                return
-            await self._submit_pending(gid, uid, nick, virtual, umo=event.unified_msg_origin)
-            yield event.plain_result(f"已按人工方式提交「《{source}》{query}」，等待管理员审核~")
+            async for r in self._enter_confirm_step(event, gid, uid, nick, virtual):
+                yield r
             return
 
         # ── 入口：解析关键词 ─────────────────────────────────────────
         parts = msg.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
+        if len(parts) < 2 or not parts[1].strip() or "/" not in parts[1]:
             yield event.plain_result(
                 f"{nick}，请用「添老婆 角色名/作品名」来搜索，例如：\n"
                 f"添老婆 紫苑/eden*\n"
-                f"添老婆 博丽灵梦/东方Project"
+                f"添老婆 博丽灵梦/东方Project\n"
+                f"必须带斜杠，不然容易找错角色~"
             )
             return
 
         raw = parts[1].strip()
-
-        # 没有斜杠 → 提醒用户补作品名，等待他确认或补充
-        if "/" not in raw:
-            import time as _time
-            add_sessions.setdefault(gid, {})[uid] = {
-                "step": "waiting_input",
-                "query": raw,
-                "source": "",
-                "expire_time": _time.time() + ADD_SESSION_TTL,
-            }
-            save_add_sessions()
-            yield event.plain_result(
-                f"{nick}，建议加上作品名让搜索更准确，格式：\n"
-                f"添老婆 {raw}/作品名\n\n"
-                f"如果不知道作品名，直接再发一次「{raw}」继续搜索也可以~"
-            )
-            return
-
-        # 有斜杠 → 拆分角色名/作品名
         char_part, source_part = raw.split("/", 1)
         query = char_part.strip()
         hint_source = source_part.strip()
@@ -1957,6 +1940,158 @@ class WifePlugin(Star):
 
         async for res in self._do_search_and_show(event, gid, uid, nick, query, offset=0, _hint_source=hint_source):
             yield res
+
+    # ── 添老婆：提交确认辅助 ──────────────────────────────────────────────
+    def _is_chinese(self, s: str) -> bool:
+        return any("一" <= c <= "鿿" for c in (s or ""))
+
+    def _format_confirm_msg(self, chosen: dict) -> str:
+        src = f"《{chosen.get('source', '')}》" if chosen.get("source") else "（来源未知）"
+        return (
+            f"将以 {src}{chosen.get('name', '')} 提交。\n"
+            f"回复：确认 / 改名 中文名 / 改作品 作品名 / 取消\n"
+            f"30 秒内无回复将按上面的名字自动提交。"
+        )
+
+    async def _enter_confirm_step(
+        self, event, gid: str, uid: str, nick: str, chosen: dict
+    ):
+        """进入提交确认阶段：调 AI 取中文名后展示给用户。"""
+        import time as _t
+        chosen = dict(chosen)  # 防止外部 dict 被改
+
+        # AI 解析中文名 / 中文作品短名
+        char = chosen.get("name", "")
+        source = chosen.get("source", "")
+        try:
+            trans = self._get_translation_from_cache(char, source) or await self._ai_translate_multi(
+                char=char, source=source
+            )
+        except Exception:
+            trans = None
+        if trans:
+            zh_char = (trans.get("zh_char") or "").strip()
+            zh_src = (trans.get("short_source") or "").strip()
+            if zh_char and self._is_chinese(zh_char):
+                chosen["name"] = zh_char
+            if zh_src and self._is_chinese(zh_src) and not self._is_chinese(source or ""):
+                chosen["source"] = zh_src
+
+        # 软查重：命中"质量差"条目时只提示，不阻止提交
+        hit, soft = await self._char_exists_in_list_soft(chosen["name"], source=chosen.get("source", ""))
+        if hit and not soft:
+            src = f"《{chosen.get('source', '')}》" if chosen.get("source") else ""
+            yield event.plain_result(
+                f"「{src}{chosen['name']}」已经在老婆库里了哦~（与「{hit}」重复）"
+            )
+            return
+        if hit and soft:
+            yield event.plain_result(
+                f"⚠️ 似乎已有相似条目「{hit}」，但翻译档案不完整，仍可提交，由管理员人工确认。"
+            )
+
+        # 写入 waiting_confirm 会话
+        add_sessions.setdefault(gid, {})[uid] = {
+            "step": "waiting_confirm",
+            "candidate": chosen,
+            "umo": event.unified_msg_origin,
+            "expire_time": _t.time() + 30,
+        }
+        save_add_sessions()
+        yield event.plain_result(self._format_confirm_msg(chosen))
+
+        # 30 秒后自动按当前候选提交
+        asyncio.create_task(self._auto_finalize_submission(gid, uid, nick))
+
+    async def _auto_finalize_submission(self, gid: str, uid: str, nick: str):
+        """30 秒后兜底自动提交。"""
+        await asyncio.sleep(30)
+        sess = add_sessions.get(gid, {}).get(uid)
+        if not sess or sess.get("step") != "waiting_confirm":
+            return
+        cand = sess.get("candidate") or {}
+        umo = sess.get("umo", "")
+        add_sessions[gid].pop(uid, None)
+        save_add_sessions()
+        result = await self._finalize_submission_silent(gid, uid, nick, cand, umo=umo)
+        try:
+            await self.context.send_message(umo, MessageChain().message(result))
+        except Exception as e:
+            logger.warning(f"[添老婆] 自动提交通知失败: {e}")
+
+    async def _finalize_submission(
+        self, event, gid: str, uid: str, nick: str, chosen: dict
+    ):
+        """提交流程（合并附议 + 入队 + 私聊管理员）。"""
+        text = await self._finalize_submission_silent(
+            gid, uid, nick, chosen, umo=event.unified_msg_origin
+        )
+        yield event.plain_result(text)
+
+    async def _finalize_submission_silent(
+        self, gid: str, uid: str, nick: str, chosen: dict, umo: str = ""
+    ) -> str:
+        """返回纯文本结果（不 yield，方便后台任务复用）。"""
+        if not chosen.get("name"):
+            return "提交失败：角色名为空"
+        src = f"《{chosen.get('source', '')}》" if chosen.get("source") else ""
+
+        # ── 同角色合并附议 ──
+        existed_pid = self._find_existing_pending(chosen.get("name", ""), chosen.get("source", ""))
+        if existed_pid:
+            rec = pending_queue[existed_pid]
+            co = rec.setdefault("co_submitters", [])
+            if uid != rec.get("uid") and uid not in co:
+                co.append(uid)
+                rec.setdefault("co_nicks", {})[uid] = nick
+                save_pending()
+            return f"已有人提交过「{src}{chosen['name']}」，已为你附议；上线后会一并通知~"
+
+        await self._submit_pending(gid, uid, nick, chosen, umo=umo)
+        return f"已提交「{src}{chosen['name']}」，等待管理员审核~"
+
+    @staticmethod
+    def _norm_key(name: str, source: str) -> tuple[str, str]:
+        def _n(s):
+            return re.sub(r"[\s\-_:：·・]+", "", (s or "").strip().lower())
+        return _n(name), _n(source)
+
+    def _find_existing_pending(self, name: str, source: str) -> str | None:
+        """在 pending_queue 里查同 (规范化角色名, 规范化作品名) 的未完成条目。"""
+        key = self._norm_key(name, source)
+        for pid, rec in pending_queue.items():
+            if rec.get("status") in ReviewStatus.DONE:
+                continue
+            if self._norm_key(rec.get("char_name", ""), rec.get("source", "")) == key:
+                return pid
+        return None
+
+    async def _char_exists_in_list_soft(
+        self, char_name: str, source: str = ""
+    ) -> tuple[str | None, bool]:
+        """模糊查重，返回 (hit, soft)。
+        soft=True 表示命中条目的翻译档案不完整（zh/en 缺失），调用方应只提示而不拒收。
+        """
+        hit = await self._char_exists_in_list(char_name, source=source)
+        if not hit:
+            return None, False
+        # 检查命中条目翻译质量
+        try:
+            cache = self._load_en_cache()
+            for key, entry in cache.items():
+                ex_char = key.split("|", 1)[0] if "|" in key else key
+                if ex_char != hit:
+                    continue
+                en_ex = (entry.get("en_char") or entry.get("en") or "").strip()
+                zh_ex = (entry.get("zh_char") or "").strip()
+                if not en_ex or (zh_ex and not self._is_chinese(zh_ex)):
+                    return hit, True  # 质量差
+                if not zh_ex:
+                    return hit, True
+                return hit, False
+        except Exception:
+            pass
+        return hit, False
 
     async def _do_search_and_show(
         self, event: AstrMessageEvent,
@@ -2625,6 +2760,10 @@ query ($search: String) {
                     f"✅ PR 已创建：\n{pr_url}\n"
                     f"merge 完成后发「pr上线 {pid}」通知群友~"
                 )
+                src_ann = f"《{rec['source']}》" if rec.get("source") else ""
+                await self._notify_submitters(
+                    rec, f"「{src_ann}{rec['char_name']}」的 PR 已创建，等 merge 上线~"
+                )
             else:
                 yield event.plain_result("PR 创建失败，请检查 github_token 和仓库配置")
 
@@ -2781,7 +2920,15 @@ query ($search: String) {
                 if not rec.get("source"):
                     entry += "\n    ⚠️ 来源未知，可用「通过 " + str(i) + " 作品名」补充"
                 lines.append(entry)
-            lines.append("\n──────────────────\n指令说明：\n通过 1          → 通过第1条\n通过 1 魔法少女小圆   → 通过并补充来源\n拒绝 1          → 拒绝第1条\npr上线 1        → 通知群友上线")
+            lines.append(
+                "\n──────────────────\n指令说明：\n"
+                "通过 1                  → 通过第1条（进入选图）\n"
+                "通过 1 魔法少女小圆      → 通过并改作品（老语法）\n"
+                "通过 1 作品:X 角色:Y    → 通过并改作品/角色（推荐）\n"
+                "快速通过 1              → 通过并直接用第一张图建 PR\n"
+                "拒绝 1                  → 拒绝第1条\n"
+                "pr上线 1                → merge 后通知群友 + 发券"
+            )
             yield event.plain_result("\n".join(lines))
             return
 
@@ -2806,25 +2953,46 @@ query ($search: String) {
             save_pending()
             src = f"《{rec['source']}》" if rec.get("source") else ""
             char_name = rec["char_name"]
-            platform = rec.get("platform", "default")
-            await self._notify_group_at(
-                rec["gid"], rec["uid"],
-                f"你提交的{src}{char_name}审核通过并已上线啦！快去「抽老婆」试试看~🎉",
-                platform,
+            await self._notify_submitters(
+                rec,
+                f"你提交的{src}{char_name}审核通过并已上线啦！快去「抽老婆」试试看~🎉\n奖励：换本命券 ×1"
             )
-            yield event.plain_result(f"✅ 已通知群 {rec['gid']}：{src}{char_name} 上线成功~")
+            self._grant_online_tickets(rec)
+            n_co = len(rec.get("co_submitters") or [])
+            extra = f"（含 {n_co} 位附议者）" if n_co else ""
+            yield event.plain_result(f"✅ 已通知群 {rec['gid']}{extra}：{src}{char_name} 上线成功~")
             return
 
-        parts = msg.split(maxsplit=2)
+        # 快速通过：通过 + 自动用第一张拉到的图建 PR
+        if msg.startswith("快速通过"):
+            parts_q = msg.split(maxsplit=1)
+            if len(parts_q) < 2:
+                yield event.plain_result("用法：快速通过 <序号/pid>")
+                return
+            pid = self._resolve_pid(parts_q[1].strip())
+            if not pid:
+                yield event.plain_result(f"找不到记录：{parts_q[1].strip()}")
+                return
+            async for r in self._do_approve(event, pid, override_source=None, override_char=None, quick=True):
+                yield r
+            return
+
+        parts = msg.split(maxsplit=1)
         if len(parts) < 2 or parts[0] not in ("通过", "拒绝"):
             return
 
         action = parts[0]
-        pid = self._resolve_pid(parts[1].strip())
-        if not pid:
-            yield event.plain_result(f"找不到记录：{parts[1].strip()}，请重新「拉取老婆审核」")
+        rest = parts[1].strip()
+        sub = rest.split(maxsplit=1)
+        if not sub:
+            yield event.plain_result(f"用法：{action} <序号/pid> [作品名 / 作品:X 角色:Y]")
             return
-        override_source = parts[2].strip() if len(parts) == 3 else None
+        pid = self._resolve_pid(sub[0].strip())
+        if not pid:
+            yield event.plain_result(f"找不到记录：{sub[0].strip()}，请重新「拉取老婆审核」")
+            return
+        tail = sub[1].strip() if len(sub) > 1 else ""
+        override_source, override_char = self._parse_approve_overrides(tail)
         rec = pending_queue.get(pid)
         if not rec:
             yield event.plain_result(f"找不到审核记录：{pid}")
@@ -2836,15 +3004,97 @@ query ($search: String) {
             src = f"《{rec['source']}》" if rec['source'] else ""
             yield event.plain_result(f"已拒绝「{src}{rec['char_name']}」")
             platform = rec.get("platform", "default")
-            await self._notify_group_at(rec["gid"], rec["uid"], f"你提交的「{src}{rec['char_name']}」审核未通过~", platform)
+            await self._notify_submitters(rec, f"你提交的「{src}{rec['char_name']}」审核未通过~")
             return
 
+        async for r in self._do_approve(event, pid, override_source=override_source, override_char=override_char, quick=False):
+            yield r
+
+    @staticmethod
+    def _parse_approve_overrides(tail: str) -> tuple[str | None, str | None]:
+        """解析「通过」尾部参数。
+        支持：
+          ''                    → (None, None)
+          '魔法少女小圆'         → (魔法少女小圆, None)   兼容老语法
+          '作品:X'              → (X, None)
+          '角色:Y'              → (None, Y)
+          '作品:X 角色:Y'       → (X, Y)
+          '角色:Y 作品:X'       → (X, Y)
+        """
+        if not tail:
+            return None, None
+        # 有任一显式前缀就走新语法
+        if "作品:" in tail or "角色:" in tail or "作品：" in tail or "角色：" in tail:
+            src = char = None
+            tail2 = tail.replace("：", ":")
+            # 简单拆：扫描每个 token，找 作品:/角色: 起始
+            tokens = tail2.split()
+            buf_key = None
+            buf_val: list[str] = []
+            def flush():
+                nonlocal src, char, buf_key, buf_val
+                if not buf_key:
+                    return
+                val = " ".join(buf_val).strip()
+                if buf_key == "作品":
+                    src = val or src
+                elif buf_key == "角色":
+                    char = val or char
+                buf_key, buf_val = None, []
+            for tok in tokens:
+                if tok.startswith("作品:"):
+                    flush()
+                    buf_key = "作品"
+                    rest = tok[len("作品:"):]
+                    if rest:
+                        buf_val.append(rest)
+                elif tok.startswith("角色:"):
+                    flush()
+                    buf_key = "角色"
+                    rest = tok[len("角色:"):]
+                    if rest:
+                        buf_val.append(rest)
+                else:
+                    if buf_key:
+                        buf_val.append(tok)
+            flush()
+            return src, char
+        # 老语法：整串当作品名
+        return tail, None
+
+    async def _notify_submitters(self, rec: dict, text: str):
+        """通知提交者 + 所有附议者（同群）。"""
+        platform = rec.get("platform", "default")
+        gid = rec.get("gid", "")
+        uids = [rec.get("uid", "")] + list(rec.get("co_submitters") or [])
+        seen = set()
+        for u in uids:
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            try:
+                await self._notify_group_at(gid, u, text, platform)
+            except Exception as e:
+                logger.warning(f"[审核] 通知 {u} 失败: {e}")
+
+    async def _do_approve(
+        self, event, pid: str,
+        override_source: str | None, override_char: str | None,
+        quick: bool,
+    ):
+        """通过审核：覆盖名字、推送进度、拉图建 PR（quick=自动选第一张）。"""
+        rec = pending_queue.get(pid)
+        if not rec:
+            yield event.plain_result(f"找不到审核记录：{pid}")
+            return
         if rec.get("status") in ReviewStatus.LOCKED:
             yield event.plain_result(f"该申请已处理过（状态：{ReviewStatus.label(rec['status'])}），请勿重复操作")
             return
-        # ── 通过：先拉图私聊确认，再创建 PR ──────────────────────────────
+
         if override_source:
             rec["source"] = override_source
+        if override_char:
+            rec["char_name"] = override_char
         rec["status"] = ReviewStatus.APPROVED
         save_pending()
         src = f"《{rec['source']}》" if rec['source'] else ""
@@ -2853,6 +3103,10 @@ query ($search: String) {
 
         img_dir = self._get_img_dir(rec["source"])
         yield event.plain_result(f"已通过「{src}{rec['char_name']}」，正在拉取图片供确认...")
+        # #7 群内推送：已通过，进入拉图阶段
+        await self._notify_submitters(
+            rec, f"你提交的「{src}{rec['char_name']}」已通过审核，正在拉图准备 PR…"
+        )
 
         images = await self._fetch_character_images(
             rec["char_name"], rec.get("source", ""), count=3, fallback_thumb_url=rec.get("thumb_url", "")
@@ -2870,6 +3124,27 @@ query ($search: String) {
                     f"PR 已创建：\n{pr_url}\n"
                     f"请上传图片到分支 {img_dir}/ 目录后 merge，\n"
                     f"merge 完成后发「pr上线 {pid}」通知群友~"
+                )
+                await self._notify_submitters(
+                    rec, f"「{src}{rec['char_name']}」的 PR 已创建（空 PR，等管理员手动补图），等 merge 上线~"
+                )
+            else:
+                yield event.plain_result("PR 创建失败，请检查 github_token 和仓库配置")
+            return
+
+        # 快速通过：直接用第一张图建 PR
+        if quick:
+            yield event.plain_result(f"快速模式：自动用第 1 张图建 PR...")
+            pr_url = await self._create_github_pr(rec["source"], rec["char_name"], img_dir, [images[0]])
+            if pr_url:
+                rec["status"] = ReviewStatus.PR_CREATED
+                rec["pr_url"] = pr_url
+                save_pending()
+                yield event.plain_result(
+                    f"✅ PR 已创建：\n{pr_url}\nmerge 完成后发「pr上线 {pid}」通知群友~"
+                )
+                await self._notify_submitters(
+                    rec, f"「{src}{rec['char_name']}」的 PR 已创建，等 merge 上线~"
                 )
             else:
                 yield event.plain_result("PR 创建失败，请检查 github_token 和仓库配置")
@@ -2919,7 +3194,7 @@ query ($search: String) {
             yield event.plain_result(f"私聊发图失败（{e}），回复「选 N {pid}」/「换图 {pid}」/「跳过 {pid}」继续")
 
     async def pr_online(self, event: AstrMessageEvent):
-        """管理员命令：pr上线 pid —— merge后艾特提交者通知审核通过上线"""
+        """管理员命令：pr上线 pid —— merge后艾特提交者+附议者，并发换本命券"""
         uid = str(event.get_sender_id())
         if uid != str(self.admin_qq):
             return
@@ -2930,7 +3205,7 @@ query ($search: String) {
             yield event.plain_result("用法：pr上线 <pid>")
             return
 
-        pid = parts[1].strip()
+        pid = self._resolve_pid(parts[1].strip()) or parts[1].strip()
         rec = pending_queue.get(pid)
         if not rec:
             yield event.plain_result(f"找不到记录：{pid}")
@@ -2945,16 +3220,30 @@ query ($search: String) {
 
         src = f"《{rec['source']}》" if rec.get("source") else ""
         char_name = rec["char_name"]
-        submitter_uid = rec["uid"]
         gid = rec["gid"]
-        platform = rec.get("platform", "default")
 
-        await self._notify_group_at(
-            gid, submitter_uid,
-            f"你提交的{src}{char_name}审核通过并已上线啦！快去「抽老婆」试试看~🎉",
-            platform,
+        await self._notify_submitters(
+            rec,
+            f"你提交的{src}{char_name}审核通过并已上线啦！快去「抽老婆」试试看~🎉\n奖励：换本命券 ×1"
         )
-        yield event.plain_result(f"✅ 已通知群 {gid}：{src}{char_name} 上线成功~")
+        self._grant_online_tickets(rec)
+        n_co = len(rec.get("co_submitters") or [])
+        extra = f"（含 {n_co} 位附议者）" if n_co else ""
+        yield event.plain_result(f"✅ 已通知群 {gid}{extra}：{src}{char_name} 上线成功~")
+
+    def _grant_online_tickets(self, rec: dict):
+        """#8：上线时给提交者 + 所有附议者各 1 张换本命券。"""
+        gid = rec.get("gid", "")
+        uids = [rec.get("uid", "")] + list(rec.get("co_submitters") or [])
+        seen = set()
+        for u in uids:
+            if not u or u in seen or not gid:
+                continue
+            seen.add(u)
+            try:
+                self.favorites.add_ticket(gid, u, 1)
+            except Exception as e:
+                logger.warning(f"[审核] 发换本命券 {u} 失败: {e}")
 
     async def _fetch_character_images(
         self, char_name: str, source: str, count: int = 3, fallback_thumb_url: str = ""
@@ -3026,8 +3315,8 @@ query ($search: String) {
         self.favorites.start_session(gid, uid)
         yield event.plain_result(
             f"{nick}，开始选本命（3 个，10 分钟内有效）。\n"
-            f"回复：本命 角色或作品关键词\n"
-            f"不想选发「跳过」即可~"
+            f"先发「作品 作品名关键词」选作品 → 列角色 → 回数字选。\n"
+            f"找不到作品：用「添老婆 角色名/作品名」申请；想结束发「跳过」。"
         )
 
     async def view_favorites(self, event: AstrMessageEvent):
@@ -3073,99 +3362,192 @@ query ($search: String) {
         save_records()
         self.favorites.start_session(gid, uid)
         yield event.plain_result(
-            f"{nick}，请重新选 3 个本命。\n回复：本命 角色或作品关键词；发「跳过」结束。"
+            f"{nick}，请重新选 3 个本命。\n发「作品 关键词」选作品 → 列角色 → 回数字选；「跳过」结束。"
         )
 
     async def _handle_favorite_session(self, event, session: dict, text: str):
-        """本命引导会话内的消息分发。"""
+        """本命引导会话：作品 → 角色 两层。
+
+        指令：作品 关键词 / 角色 关键词 / 换一批 / 返回 / 跳过 / 取消 / 数字
+        """
         gid = str(event.message_obj.group_id)
         uid = str(event.get_sender_id())
-        nick = event.get_sender_name()
         self.favorites.touch_session(session)
+        PAGE = 9
 
-        # 用户在等候选数字
-        if session.get("candidates"):
-            if text == "取消":
-                self.favorites.clear_session(gid, uid)
-                yield event.plain_result("已取消本命选择~")
-                return
-            if text == "跳过":
-                # 跳过当前位
-                session["candidates"] = []
-                if not session.get("picked"):
-                    self.favorites.commit_picks(gid, uid, [])
-                    self.favorites.clear_session(gid, uid)
-                    yield event.plain_result("已跳过本命设置，下次想用发「设置本命」~")
-                    return
-                yield event.plain_result(f"已跳过当前候选，已选 {len(session['picked'])} 个。继续发「本命 关键词」选下一个，或「跳过」结束。")
-                if len(session["picked"]) >= FavoritesService.MAX_PICKS:
-                    self.favorites.commit_picks(gid, uid, session["picked"])
-                    self.favorites.clear_session(gid, uid)
-                    yield event.plain_result("本命已锁定 ✅ 现在去抽老婆吧~")
-                return
-            if text.isdigit():
-                idx = int(text) - 1
-                cands = session["candidates"]
-                if not (0 <= idx < len(cands)):
-                    yield event.plain_result(f"请输入 1~{len(cands)} 的数字")
-                    return
-                chosen = cands[idx]
-                if chosen in session["picked"]:
-                    yield event.plain_result("已经选过这位了，换一个~")
-                    return
-                session["picked"].append(chosen)
-                session["candidates"] = []
-                left = FavoritesService.MAX_PICKS - len(session["picked"])
-                yield event.plain_result(
-                    f"已加入本命：{FavoritesService._display(chosen)}（{len(session['picked'])}/{FavoritesService.MAX_PICKS}）"
-                )
-                if left <= 0:
-                    self.favorites.commit_picks(gid, uid, session["picked"])
-                    self.favorites.clear_session(gid, uid)
-                    yield event.plain_result("本命已锁定 ✅ 现在去抽老婆吧~")
-                else:
-                    yield event.plain_result(f"再选 {left} 个，回复「本命 关键词」继续；不想选发「跳过」。")
-                return
-            # 其他文本：当作新搜索关键词处理
-            # fallthrough
-
-        # 搜索新关键词
-        if text == "跳过":
-            self.favorites.commit_picks(gid, uid, session.get("picked", []))
-            self.favorites.clear_session(gid, uid)
-            n = len(session.get("picked", []))
-            if n > 0:
-                yield event.plain_result(f"已锁定 {n} 个本命（其余位空着）。去抽老婆吧~")
-            else:
-                yield event.plain_result("已跳过本命设置，下次想用发「设置本命」~")
-            return
+        # 通用：跳过/取消/数字
         if text == "取消":
             self.favorites.clear_session(gid, uid)
             yield event.plain_result("已取消本命选择~")
             return
-        if not text.startswith("本命"):
-            # 不是会话指令，忽略不打断别人聊天
+
+        if text == "跳过":
+            # 单作品视角下「跳过」=放弃这个作品换下一个；总会话「跳过」=结束
+            if session.get("mode") == "char_search" and session.get("current_work"):
+                session["mode"] = "work_search"
+                session["current_work"] = ""
+                session["candidates"] = []
+                session["page"] = 0
+                yield event.plain_result("已放弃当前作品。继续发「作品 关键词」搜下一个，或「跳过」结束。")
+                return
+            picks = session.get("picked", [])
+            self.favorites.commit_picks(gid, uid, picks)
+            self.favorites.clear_session(gid, uid)
+            if picks:
+                yield event.plain_result(f"已锁定 {len(picks)} 个本命（其余位空着）。去抽老婆吧~")
+            else:
+                yield event.plain_result("已跳过本命设置，下次想用发「设置本命」~")
             return
-        kw = text[2:].strip()
-        if not kw:
-            yield event.plain_result("用法：本命 角色或作品关键词")
+
+        if text == "返回":
+            session["mode"] = "work_search"
+            session["current_work"] = ""
+            session["candidates"] = []
+            session["page"] = 0
+            yield event.plain_result("已回到作品选择。请发「作品 关键词」。")
             return
-        results = self.favorites.search(kw, limit=10)
-        # 过滤已选
-        results = [r for r in results if r not in session["picked"]]
-        if not results:
+
+        if text == "换一批":
+            session["page"] = int(session.get("page", 0) or 0) + 1
+            async for r in self._render_fav_page(event, session):
+                yield r
+            return
+
+        # 数字选择
+        if text.isdigit():
+            cands = session.get("candidates") or []
+            page = int(session.get("page", 0) or 0)
+            view = cands[page * PAGE:(page + 1) * PAGE]
+            idx = int(text) - 1
+            if not (0 <= idx < len(view)):
+                yield event.plain_result(f"请输入 1~{len(view)} 的数字")
+                return
+            chosen = view[idx]
+            if session.get("mode") == "work_search":
+                # 进入作品角色列表
+                source = chosen
+                chars = self.favorites.works.chars_of(source)
+                # 过滤已选
+                chars = [c for c in chars if c not in session["picked"]]
+                if not chars:
+                    yield event.plain_result(f"《{source}》没有可选角色了（可能都被你选过了）。回「返回」换作品。")
+                    return
+                session["mode"] = "char_search"
+                session["current_work"] = source
+                session["candidates"] = chars
+                session["page"] = 0
+                session["kw"] = ""
+                async for r in self._render_fav_page(event, session):
+                    yield r
+                return
+            # char_search → 选定一个角色
+            if chosen in session["picked"]:
+                yield event.plain_result("已经选过这位了~")
+                return
+            session["picked"].append(chosen)
             yield event.plain_result(
-                f"没找到「{kw}」相关的角色。\n"
-                f"可能还没收录，发「添老婆 {kw}/作品名」提交一下；或换个关键词再试~"
+                f"已加入本命：{FavoritesService._display(chosen)}（{len(session['picked'])}/{FavoritesService.MAX_PICKS}）"
             )
+            if len(session["picked"]) >= FavoritesService.MAX_PICKS:
+                self.favorites.commit_picks(gid, uid, session["picked"])
+                self.favorites.clear_session(gid, uid)
+                yield event.plain_result("本命已锁定 ✅ 现在去抽老婆吧~")
+                return
+            # 回到作品选择
+            session["mode"] = "work_search"
+            session["current_work"] = ""
+            session["candidates"] = []
+            session["page"] = 0
+            yield event.plain_result(f"再选 {FavoritesService.MAX_PICKS - len(session['picked'])} 个。发「作品 关键词」继续，或「跳过」结束。")
             return
-        if len(results) > 10:
-            yield event.plain_result("候选太多，请再具体一点（带作品名更准）。")
+
+        # 关键词：作品 X / 角色 X
+        if text.startswith("作品"):
+            kw = text[2:].strip()
+            if not kw:
+                yield event.plain_result("用法：作品 关键词")
+                return
+            results = self.favorites.works.search_works(kw)
+            if not results:
+                yield event.plain_result(
+                    f"老婆库里没有《{kw}》相关作品。\n"
+                    f"要不要去申请？发：添老婆 角色名/{kw}\n"
+                    f"（继续发「作品 关键词」搜别的；「跳过」结束）"
+                )
+                return
+            session["mode"] = "work_search"
+            session["current_work"] = ""
+            session["candidates"] = results
+            session["page"] = 0
+            session["kw"] = kw
+            async for r in self._render_fav_page(event, session):
+                yield r
             return
-        session["candidates"] = results
-        lines = [f"找到这些（回复数字选一个，不要发「跳过」换关键词）："]
-        for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {FavoritesService._display(r)}")
+
+        if text.startswith("角色"):
+            if session.get("mode") != "char_search" or not session.get("current_work"):
+                yield event.plain_result("先用「作品 关键词」选作品；进入作品后才能用「角色 关键词」筛选。")
+                return
+            kw = text[2:].strip()
+            chars = self.favorites.works.chars_of(session["current_work"])
+            chars = [c for c in chars if c not in session["picked"]]
+            if kw:
+                kw_l = kw.lower()
+                chars = [c for c in chars if kw_l in FavoritesService._split(c)[1].lower()]
+            if not chars:
+                yield event.plain_result(f"《{session['current_work']}》里没匹配到「{kw}」的角色。回「返回」换作品。")
+                return
+            session["candidates"] = chars
+            session["page"] = 0
+            session["kw"] = kw
+            async for r in self._render_fav_page(event, session):
+                yield r
+            return
+
+        # 兼容老语法：本命 关键词 直接当作品搜索
+        if text.startswith("本命"):
+            kw = text[2:].strip()
+            if not kw:
+                yield event.plain_result("用法：作品 作品名关键词")
+                return
+            faux_text = f"作品 {kw}"
+            async for r in self._handle_favorite_session(event, session, faux_text):
+                yield r
+            return
+
+        # 不是会话指令：不打断别人聊天
+
+    async def _render_fav_page(self, event, session: dict):
+        """渲染当前 candidates 的分页。"""
+        PAGE = 9
+        cands = session.get("candidates") or []
+        if not cands:
+            yield event.plain_result("当前没有候选。发「作品 关键词」开始搜索。")
+            return
+        page = int(session.get("page", 0) or 0)
+        total = len(cands)
+        max_page = max(0, (total - 1) // PAGE)
+        if page > max_page:
+            page = 0
+            session["page"] = 0
+        view = cands[page * PAGE:(page + 1) * PAGE]
+
+        if session.get("mode") == "work_search":
+            title = f"找到 {total} 部作品（第 {page+1}/{max_page+1} 页）" if total else "没匹配到作品"
+            items = [f"{i}. 《{s}》" for i, s in enumerate(view, 1)]
+            tail = "回复数字选作品；"
+        else:
+            src = session.get("current_work", "")
+            kw = session.get("kw", "")
+            extra = f"（关键词:{kw}）" if kw else ""
+            title = f"《{src}》收录角色 {total} 位{extra}（第 {page+1}/{max_page+1} 页）"
+            items = [f"{i}. {FavoritesService._split(c)[1]}" for i, c in enumerate(view, 1)]
+            tail = "回复数字选角色；「角色 关键词」缩小范围；「返回」换作品；"
+        lines = [title] + items
+        if max_page > 0:
+            tail += "「换一批」翻页；"
+        tail += "「跳过」放弃这位；「取消」退出"
+        lines.append(tail)
         yield event.plain_result("\n".join(lines))
 
     async def admin_reset_favorite_intro(self, event: AstrMessageEvent):
