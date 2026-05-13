@@ -349,6 +349,182 @@ class WifePlugin(Star):
         asyncio.create_task(self._bg_fill_en_cache())
         # 定时写盘：每5分钟把去重池脏数据写入文件
         asyncio.create_task(self._bg_flush_drawn_pool())
+        # 注册模块级单例，供其他插件（如 wifepicker）联动调用
+        global _PLUGIN_INSTANCE
+        _PLUGIN_INSTANCE = self
+
+    # ==================== 跨插件联动 API ====================
+    # 这些方法供 wifepicker 等其他插件通过 get_instance() 调用，
+    # 调用方应 try/except 包裹，本插件不保证向后兼容。
+
+    def is_karma_locked(self, gid: str, uid: str) -> bool:
+        """是否处于今日业力惩罚锁（用于跨插件镜像保护）。"""
+        try:
+            today = get_today()
+            cfg = load_group_config(str(gid))
+            wd = cfg.get(str(uid))
+            return (isinstance(wd, list) and len(wd) > 3
+                    and wd[3] == "karma_locked" and wd[1] == today)
+        except Exception:
+            return False
+
+    def grant_title(self, gid: str, uid: str, title: str) -> bool:
+        """供联动方写称号（命中注定 / 双修等）。"""
+        try:
+            gid, uid, title = str(gid), str(uid), str(title)
+            group_titles = records.setdefault("titles", {}).setdefault(gid, {})
+            user_titles = group_titles.setdefault(uid, [])
+            if title not in user_titles:
+                user_titles.append(title)
+                save_records()
+            return True
+        except Exception:
+            return False
+
+    def grant_streak_freeze(self, gid: str, uid: str, n: int = 1) -> int:
+        """供联动方发补签券，返回当前持有数。"""
+        try:
+            n = max(0, int(n))
+            if n == 0:
+                return self.streak_freeze.tokens(str(gid), str(uid))
+            cur = self.streak_freeze.get(str(gid), str(uid))
+            cur["tokens"] = int(cur.get("tokens", 0) or 0) + n
+            save_records()
+            return int(cur["tokens"])
+        except Exception:
+            return 0
+
+    def get_today_wife_simple(self, gid: str, uid: str) -> dict | None:
+        """读取用户当天二次元老婆。无副作用。"""
+        try:
+            today = get_today()
+            cfg = load_group_config(str(gid))
+            wd = cfg.get(str(uid))
+            if not isinstance(wd, list) or len(wd) < 2 or wd[1] != today:
+                return None
+            img = wd[0]
+            if not self._is_valid_img_path(img):
+                return None
+            return {
+                "img": img,
+                "name": self._wife_display_name(img),
+                "is_karma_locked": len(wd) > 3 and wd[3] == "karma_locked",
+            }
+        except Exception:
+            return None
+
+    def get_benming_chars(self, gid: str, uid: str) -> list[str]:
+        """读取用户的本命角色列表（img 路径形式）。无副作用。"""
+        try:
+            rec = self.favorites.get_record(str(gid), str(uid))
+            return list(rec.get("chars") or [])
+        except Exception:
+            return []
+
+    async def silent_draw_today_wife(self, gid: str, uid: str, nick: str) -> dict | None:
+        """供联动用的静默抽卡：
+        - 已抽过 → 返回当日记录
+        - 新用户（未设本命且未看过引导）→ 返回 {"needs_onboarding": True}
+        - 否则走 karma/season/pool/fav/up/normal 完整链路并写入 cfg
+        - 失败 → 返回 None
+        """
+        gid, uid = str(gid), str(uid)
+        today = get_today()
+        # 已抽过：直接返回
+        async with get_config_lock(gid):
+            _cfg = load_group_config(gid)
+            _wd = _cfg.get(uid)
+            if isinstance(_wd, list) and len(_wd) >= 2 and _wd[1] == today and self._is_valid_img_path(_wd[0]):
+                return {
+                    "img": _wd[0],
+                    "name": self._wife_display_name(_wd[0]),
+                    "source": "cached",
+                    "is_karma_locked": len(_wd) > 3 and _wd[3] == "karma_locked",
+                    "is_new": False,
+                }
+        # 新用户引导拦截
+        if not self.favorites.has_favorites(gid, uid) and not self.favorites.intro_seen(gid, uid):
+            return {"needs_onboarding": True}
+
+        img = None
+        source = "normal"
+        is_karma_locked = False
+        try:
+            karma = self._get_karma(gid)
+            triggered, karma_img, _ = karma.roll_karma(records["karma_resets"], gid, uid)
+            if triggered:
+                img, source, is_karma_locked = karma_img, "karma", True
+            if not img:
+                _s = self.season.roll(drawn_pool, gid, uid)
+                if _s: img, source = _s, "season"
+            if not img:
+                _p = karma.roll_up_pool()
+                if _p: img, source = _p, "pool"
+            if not img:
+                _f = self.favorites.roll_favorite(gid, uid, drawn_pool)
+                if _f: img, source = _f, "favorite"
+            if not img:
+                _u = karma.roll_up()
+                if _u: img, source = _u, "up"
+            if not img:
+                img = await self._fetch_wife_image_for_user(gid, uid)
+                if not img:
+                    return None
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [img, today, nick, "karma_locked"] if is_karma_locked else [img, today, nick]
+                save_group_config(gid, cfg)
+            try:
+                self._after_draw(gid, uid, today)
+            except Exception:
+                pass
+            return {
+                "img": img,
+                "name": self._wife_display_name(img),
+                "source": source,
+                "is_karma_locked": is_karma_locked,
+                "is_new": True,
+            }
+        except Exception as e:
+            logger.warning(f"[animewifex 联动] silent_draw_today_wife 失败: {e}")
+            return None
+
+    def _wife_display_name(self, img: str) -> str:
+        name = os.path.splitext(str(img or ""))[0].split("/")[-1]
+        if "!" in name:
+            source, chara = name.split("!", 1)
+            return f"《{source}》{chara}"
+        return name or "未知老婆"
+
+    def wife_image_url(self, img: str) -> str | None:
+        """供联动方拼接图片 URL；不下载，由调用方走 Comp.Image.fromURL。"""
+        try:
+            if not self._is_valid_img_path(img):
+                return None
+            return self.image_base_url + quote(img, safe="/!")
+        except Exception:
+            return None
+
+    def _notify_wifepicker_ntr(self, gid: str, victim_uid: str) -> None:
+        """NTR 传染：通知 wifepicker 给被牛的人加 30 分钟强娶冷却。"""
+        try:
+            from astrbot_plugin_wifepicker import main as _wp_main  # type: ignore
+            inst = getattr(_wp_main, "get_instance", lambda: None)()
+            if inst is not None:
+                inst.add_force_marry_cooldown_minutes(str(gid), str(victim_uid), 30)
+        except Exception as e:
+            logger.info(f"[联动] NTR 传染通知失败（忽略）: {e}")
+
+    def _is_wifepicker_locked_pair(self, gid: str, uid: str, tid: str) -> bool:
+        """CP 双向保护：恋爱绑定或好感度跨过该对随机锁定的阈值则生效。"""
+        try:
+            from astrbot_plugin_wifepicker import main as _wp_main
+            inst = getattr(_wp_main, "get_instance", lambda: None)()
+            if inst is None:
+                return False
+            return bool(inst.is_cp_protected(str(gid), str(uid), str(tid)))
+        except Exception:
+            return False
 
     def _init_config(self):
         """初始化配置参数"""
@@ -629,6 +805,60 @@ class WifePlugin(Star):
 
     # ==================== 抽老婆相关 ====================
 
+    async def _yield_wifepicker_link(self, event, gid: str, uid: str, nick: str, anime_img: str):
+        """抽完二次元老婆后反向调 wifepicker 抽今日群友，并把消息追加输出。
+        wifepicker 未加载或调用失败时静默跳过。
+        """
+        try:
+            from astrbot_plugin_wifepicker import main as _wp_main  # type: ignore
+        except Exception as _e:
+            logger.info(f"[联动] wifepicker 未安装/不可导入: {_e}")
+            return
+        inst = getattr(_wp_main, "get_instance", lambda: None)()
+        if inst is None:
+            logger.info("[联动] wifepicker get_instance() 返回 None，可能未重载完成")
+            return
+        try:
+            data = await inst.silent_draw_group_friend(
+                event, group_id=gid, user_id=uid, nick=nick, anime_wife_img=anime_img,
+            )
+        except Exception as _e:
+            logger.warning(f"[联动] silent_draw_group_friend 调用失败: {_e}", exc_info=True)
+            return
+        if not data:
+            logger.info("[联动] silent_draw_group_friend 返回 None（详见 wifepicker 日志）")
+            return
+        # 恋爱绑定：直接展示伴侣
+        partner_id = data.get("partner_id")
+        if partner_id:
+            text = (f"\n—— 群友老婆联动 ——\n"
+                    f"💕 你与【{data.get('partner_name')}】今日恋爱绑定中，群友老婆固定为对方。")
+            yield event.chain_result([Plain(text), Image.fromURL(data["avatar_url"])])
+            return
+        wife_id = data.get("wife_id")
+        if not wife_id:
+            return
+        td = data.get("tongdan")
+        lines = ["", "—— 群友老婆联动 ——"]
+        tag = "今日群友老婆（已抽）" if data.get("already_drawn") else "今日群友老婆"
+        lines.append(f"{tag}：【{data.get('wife_name')}】")
+        if td and td.get("shared"):
+            lines.append(f"✨ 与 TA 本命同担命中（{td.get('reason')}）：强娶时好感度 ×{td.get('mult')} 加成")
+        if not data.get("already_drawn"):
+            lines.append(f"剩余抽取次数：{data.get('remaining', 0)} 次")
+        # 全群同担群友列表（除已经在 td 里那位）
+        all_td = data.get("all_tongdan") or []
+        others = [x for x in all_td if str(x.get("uid")) != str(wife_id)]
+        if others:
+            lines.append("")
+            lines.append("🎴 本群与你本命同担的群友（强娶任意一位都触发 buff）：")
+            for x in others[:5]:
+                shared_n = len(x.get("shared") or [])
+                lines.append(f"  · {x.get('name')}（共担 {shared_n} 个）×{x.get('mult')}")
+            if len(others) > 5:
+                lines.append(f"  …还有 {len(others) - 5} 位，发「查同担」看完整列表")
+        yield event.chain_result([Plain("\n".join(lines)), Image.fromURL(data["avatar_url"])])
+
     async def animewife(self, event: AstrMessageEvent):
         """抽老婆"""
         gid = str(event.message_obj.group_id)
@@ -681,6 +911,8 @@ class WifePlugin(Star):
             if isinstance(_wd_today, list) and len(_wd_today) >= 2 and _wd_today[1] == today and self._is_valid_img_path(_wd_today[0]):
                 self._record_daily_draw(gid, uid, today)
                 yield event.chain_result(await self._build_wife_message(_wd_today[0], nick, gid=gid, uid=uid))
+                async for _r in self._yield_wifepicker_link(event, gid, uid, nick, _wd_today[0]):
+                    yield _r
                 return
 
         # ── 业力惩罚判定 ──
@@ -710,6 +942,8 @@ class WifePlugin(Star):
                 yield event.chain_result([Plain(msg), img_comp])
             else:
                 yield event.plain_result(msg)
+            async for _r in self._yield_wifepicker_link(event, gid, uid, nick, karma_img):
+                yield _r
             return
 
         # ── 季节限定卡池判定（开放期内 UP 优先） ──
@@ -735,6 +969,8 @@ class WifePlugin(Star):
                 yield event.chain_result([Plain(_s_text), img_comp])
             else:
                 yield event.plain_result(_s_text)
+            async for _r in self._yield_wifepicker_link(event, gid, uid, nick, season_img):
+                yield _r
             return
 
         # ── 常驻 UP 池判定 ──
@@ -760,6 +996,8 @@ class WifePlugin(Star):
                 yield event.chain_result([Plain(_p_text), img_comp])
             else:
                 yield event.plain_result(_p_text)
+            async for _r in self._yield_wifepicker_link(event, gid, uid, nick, pool_img):
+                yield _r
             return
 
         # ── 个人本命 UP 判定 ──
@@ -785,6 +1023,8 @@ class WifePlugin(Star):
                 yield event.chain_result([Plain(_f_text), img_comp])
             else:
                 yield event.plain_result(_f_text)
+            async for _r in self._yield_wifepicker_link(event, gid, uid, nick, fav_img):
+                yield _r
             return
 
         # ── 单角色 UP 池判定 ──
@@ -810,6 +1050,8 @@ class WifePlugin(Star):
                 yield event.chain_result([Plain(_up_text), img_comp])
             else:
                 yield event.plain_result(_up_text)
+            async for _r in self._yield_wifepicker_link(event, gid, uid, nick, up_img):
+                yield _r
             return
 
         # 先在锁外判断是否需要重新抽取
@@ -841,6 +1083,8 @@ class WifePlugin(Star):
         if bonuses and result and isinstance(result[0], Plain):
             result[0] = Plain(result[0].text + "\n" + "\n".join(bonuses))
         yield event.chain_result(result)
+        async for _r in self._yield_wifepicker_link(event, gid, uid, nick, img):
+            yield _r
 
     def _is_valid_img_path(self, img: str) -> bool:
         """校验图片路径是否合法（必须含!且有图片扩展名）"""
@@ -984,7 +1228,22 @@ class WifePlugin(Star):
             if r.get("title"):
                 parts.append(f"称号「{r['title']}」")
             msgs.append(f"🎖 里程碑：{m['desc']} → " + "，".join(parts))
+            # 资源互喂：连签类里程碑额外送 wifepicker 强娶次数 +1
+            if str(m.get("id", "")).startswith("streak_"):
+                if self._grant_wifepicker_force_bonus(gid, uid, 1):
+                    msgs.append("🎁 跨插件奖励：wifepicker 强娶次数 +1")
         return msgs
+
+    def _grant_wifepicker_force_bonus(self, gid: str, uid: str, n: int = 1) -> bool:
+        try:
+            from astrbot_plugin_wifepicker import main as _wp_main  # type: ignore
+            inst = getattr(_wp_main, "get_instance", lambda: None)()
+            if inst is None:
+                return False
+            return bool(inst.grant_force_marry_bonus(str(gid), str(uid), int(n)))
+        except Exception as e:
+            logger.info(f"[联动] grant_force_marry_bonus 调用失败（忽略）: {e}")
+            return False
 
     def _get_draw_stats(self, gid: str, uid: str) -> dict:
         return self.retention.get_draw_stats(gid, uid)
@@ -1288,6 +1547,12 @@ class WifePlugin(Star):
         # 检查目标是否有老婆并执行牛操作
         async with get_config_lock(gid):
             cfg = load_group_config(gid)
+            # 业力锁（发起者）：自己背着业力惩罚不能借牛老婆甩锅
+            _self_rec = cfg.get(uid)
+            if isinstance(_self_rec, list) and len(_self_rec) > 3 and _self_rec[3] == "karma_locked" and _self_rec[1] == today:
+                _karma_char_self = os.path.splitext(_self_rec[0])[0].split("/")[-1].split("!")[-1] if _self_rec[0] else "她"
+                yield event.plain_result(f"{nick}，业力缠身，今天得陪着{_karma_char_self}，牛不了别人~")
+                return
             if tid not in cfg or cfg[tid][1] != today:
                 yield event.plain_result("对方今天还没有老婆可牛哦~")
                 return
@@ -1295,6 +1560,10 @@ class WifePlugin(Star):
             if len(cfg[tid]) > 3 and cfg[tid][3] == "karma_locked":
                 _t_name = cfg[tid][2] if len(cfg[tid]) > 2 else "对方"
                 yield event.plain_result(f"{_t_name} 的老婆受业力庇护，今天牛不走！")
+                return
+            # CP 双向保护：wifepicker 里已恋爱绑定的对方，不能牛
+            if self._is_wifepicker_locked_pair(gid, uid, tid):
+                yield event.plain_result(f"{nick}，你和对方在群里恋爱绑定中，三次元都成了，二次元就别折腾了~")
                 return
             
             # 更新牛的次数
@@ -1313,6 +1582,9 @@ class WifePlugin(Star):
                 save_group_config(gid, cfg)
                 # 记录羁绊（uid 牛走了 tid）
                 self.bonds.record(gid, uid, tid, "ntr")
+
+                # NTR 传染：被牛的 tid 在 wifepicker 当天强娶冷却 +30 分钟
+                self._notify_wifepicker_ntr(gid, tid)
 
                 # 取消相关交换请求
                 cancel_msg = self.cancel_swap_on_wife_change(gid, [uid, tid])
@@ -1539,7 +1811,7 @@ class WifePlugin(Star):
         if not tid or tid == uid:
             yield event.plain_result(f"{nick}，请在命令后@你想交换的对象哦~")
             return
-        
+
         # 检查双方是否都有老婆
         cfg = load_group_config(gid)
         for x in (uid, tid):
@@ -1547,6 +1819,18 @@ class WifePlugin(Star):
                 who = nick if x == uid else "对方"
                 yield event.plain_result(f"{who}，今天还没有老婆，无法进行交换哦~")
                 return
+
+        # 业力锁：任一方背着业力惩罚都不能发起交换
+        for x, label in ((uid, nick), (tid, "对方")):
+            _rec = cfg.get(x)
+            if isinstance(_rec, list) and len(_rec) > 3 and _rec[3] == "karma_locked" and _rec[1] == today:
+                yield event.plain_result(f"{label} 业力缠身，今天不能交换老婆~")
+                return
+
+        # CP 双向保护：wifepicker 里已恋爱绑定的对方，不能发起交换
+        if self._is_wifepicker_locked_pair(gid, uid, tid):
+            yield event.plain_result(f"{nick}，你和对方在群里恋爱绑定中，今天就别在二次元换了~")
+            return
         
         # 记录交换请求
         rec_lim["count"] += 1
@@ -3845,3 +4129,16 @@ query ($search: String) {
         pending_queue.clear()
         drawn_pool.clear()
         _karma_cache.clear()
+        global _PLUGIN_INSTANCE
+        _PLUGIN_INSTANCE = None
+
+
+# ==================== 模块级联动入口 ====================
+# 供其他插件 try-import 调用。本插件未加载时调用方应得到 None / [] / 失败回退。
+
+_PLUGIN_INSTANCE: "WifePlugin | None" = None
+
+
+def get_instance() -> "WifePlugin | None":
+    return _PLUGIN_INSTANCE
+
