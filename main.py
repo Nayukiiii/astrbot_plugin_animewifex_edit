@@ -508,7 +508,9 @@ class WifePlugin(Star):
     def _notify_wifepicker_ntr(self, gid: str, victim_uid: str) -> None:
         """NTR 传染：通知 wifepicker 给被牛的人加 30 分钟强娶冷却。"""
         try:
-            from astrbot_plugin_wifepicker import main as _wp_main  # type: ignore
+            _wp_main = self._find_wifepicker_module()
+            if _wp_main is None:
+                return
             inst = getattr(_wp_main, "get_instance", lambda: None)()
             if inst is not None:
                 inst.add_force_marry_cooldown_minutes(str(gid), str(victim_uid), 30)
@@ -518,7 +520,9 @@ class WifePlugin(Star):
     def _is_wifepicker_locked_pair(self, gid: str, uid: str, tid: str) -> bool:
         """CP 双向保护：恋爱绑定或好感度跨过该对随机锁定的阈值则生效。"""
         try:
-            from astrbot_plugin_wifepicker import main as _wp_main
+            _wp_main = self._find_wifepicker_module()
+            if _wp_main is None:
+                return False
             inst = getattr(_wp_main, "get_instance", lambda: None)()
             if inst is None:
                 return False
@@ -805,14 +809,23 @@ class WifePlugin(Star):
 
     # ==================== 抽老婆相关 ====================
 
+    def _find_wifepicker_module(self):
+        """AstrBot 的插件不一定能用顶层 import 找到，遍历 sys.modules 抓取。"""
+        import sys
+        for name, mod in list(sys.modules.items()):
+            if mod is None:
+                continue
+            if name.endswith("astrbot_plugin_wifepicker.main") or name == "astrbot_plugin_wifepicker":
+                return mod
+        return None
+
     async def _yield_wifepicker_link(self, event, gid: str, uid: str, nick: str, anime_img: str):
         """抽完二次元老婆后反向调 wifepicker 抽今日群友，并把消息追加输出。
         wifepicker 未加载或调用失败时静默跳过。
         """
-        try:
-            from astrbot_plugin_wifepicker import main as _wp_main  # type: ignore
-        except Exception as _e:
-            logger.info(f"[联动] wifepicker 未安装/不可导入: {_e}")
+        _wp_main = self._find_wifepicker_module()
+        if _wp_main is None:
+            logger.info("[联动] sys.modules 里没找到 astrbot_plugin_wifepicker，未加载")
             return
         inst = getattr(_wp_main, "get_instance", lambda: None)()
         if inst is None:
@@ -1236,7 +1249,9 @@ class WifePlugin(Star):
 
     def _grant_wifepicker_force_bonus(self, gid: str, uid: str, n: int = 1) -> bool:
         try:
-            from astrbot_plugin_wifepicker import main as _wp_main  # type: ignore
+            _wp_main = self._find_wifepicker_module()
+            if _wp_main is None:
+                return False
             inst = getattr(_wp_main, "get_instance", lambda: None)()
             if inst is None:
                 return False
