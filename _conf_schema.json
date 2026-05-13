@@ -196,5 +196,35 @@
         "type": "float",
         "default": 0.05,
         "hint": "每次抽老婆时从常驻 UP 池出货的概率。取值范围 [0, 1]。各群可在 karma_groups.json 中单独覆盖"
+    },
+    "favorite_prob": {
+        "description": "个人本命 UP 概率",
+        "type": "float",
+        "default": 0.25,
+        "hint": "设置了本命的用户每次抽老婆从本命列表里出货的概率。取值范围 [0, 1]"
+    },
+    "favorite_change_cooldown_days": {
+        "description": "换本命冷却天数",
+        "type": "int",
+        "default": 30,
+        "hint": "每隔多少天可以免费换一次本命，期间想换需消耗换本命券"
+    },
+    "streak_freeze_weekly_grant": {
+        "description": "每周补签券数量",
+        "type": "int",
+        "default": 1,
+        "hint": "每周一首抽自动赠送的补签券数量。补签可在断签后保住连签"
+    },
+    "weekly_settle_enabled": {
+        "description": "周榜播报开关",
+        "type": "bool",
+        "default": true,
+        "hint": "默认是否在周一 00:05 自动播报上周战报。各群可发「关闭周榜/开启周榜」单独控制"
+    },
+    "season_pool": {
+        "description": "季节限定卡池配置",
+        "type": "string",
+        "default": "",
+        "hint": "JSON 字符串，结构 {name, start, end, chars: [\"作品!角色.jpg\"], rate_up}。期间内 chars 走限定 UP，且不会出现在普通池"
     }
 }

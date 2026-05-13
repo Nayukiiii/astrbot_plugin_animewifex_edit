@@ -19,6 +19,16 @@ from .services.image_fetcher import ImageFetcher
 from .services.retention import RetentionService
 from .services.review import ReviewStatus
 from .services.translation import TranslationCache
+from .services.favorites import FavoritesService
+from .services.engagement import (
+    MilestoneService,
+    StreakFreezeService,
+    DailyQuestService,
+    WorksAlbumService,
+    WeeklySettleService,
+)
+from .services.bonds import BondsService
+from .services.season import SeasonService
 
 # ==================== 常量定义 ====================
 
@@ -38,6 +48,7 @@ ADD_SESSIONS_FILE = os.path.join(CONFIG_DIR, "add_sessions.json")
 PENDING_FILE = os.path.join(CONFIG_DIR, "pending.json")
 EN_CACHE_FILE    = os.path.join(CONFIG_DIR, "en_cache.json")    # 角色名→英文名缓存
 KARMA_GROUPS_FILE = os.path.join(CONFIG_DIR, "karma_groups.json") # 分群业力配置
+BONDS_FILE       = os.path.join(CONFIG_DIR, "bonds.json")       # CP/羁绊数据
 
 # ==================== 全局数据存储 ====================
 
@@ -47,8 +58,16 @@ records = {  # 统一的记录数据结构
     "reset": {},      # 重置使用次数
     "swap": {},       # 交换老婆请求次数
     "karma_resets": {},  # 每日重置换成功次数（用于业力系统）
-    "draw_stats": {}  # 抽老婆留存统计 {gid: {uid: {last_date, streak, total_draws}}}
+    "draw_stats": {},  # 抽老婆留存统计 {gid: {uid: {last_date, streak, total_draws}}}
+    "favorites": {},   # 本命系统 {gid: {uid: {chars, set_at, intro_seen, tickets}}}
+    "milestones": {},  # 里程碑已领取 {gid: {uid: [mid, ...]}}
+    "streak_freeze": {},  # 补签券 {gid: {uid: {tokens, last_grant_week}}}
+    "daily_quests": {},   # 每日任务 {gid: {uid: {date, quests, claimed}}}
+    "weekly_settle": {},  # 周榜结算状态 {gid: {last_week, disabled}}
+    "works_done": {},     # 已通关作品 {gid: {uid: [source, ...]}}
+    "titles": {},         # 称号 {gid: {uid: [title, ...]}}
 }
+bonds_store = {}  # {gid: {pair_key: {...}}}
 drawn_pool      = {}   # 去重池 {gid: {uid: [img, ...]}}
 _list_cache_mem: list[str] = []  # list_cache.txt 内存缓存，避免每次抽老婆读盘
 DRAWN_POOL_MAX  = 500  # 每人最多保留最近N条，超出滚动丢弃
@@ -188,7 +207,24 @@ def load_records():
         "swap":         _clean(raw.get("swap", {})),
         "karma_resets": _clean(raw.get("karma_resets", {})),
         "draw_stats":   raw.get("draw_stats", {}),
+        "favorites":    raw.get("favorites", {}),
+        "milestones":   raw.get("milestones", {}),
+        "streak_freeze": raw.get("streak_freeze", {}),
+        "daily_quests": raw.get("daily_quests", {}),
+        "weekly_settle": raw.get("weekly_settle", {}),
+        "works_done":   raw.get("works_done", {}),
+        "titles":       raw.get("titles", {}),
     })
+
+
+def load_bonds():
+    raw = load_json(BONDS_FILE)
+    bonds_store.clear()
+    bonds_store.update(raw)
+
+
+def save_bonds():
+    save_json(BONDS_FILE, bonds_store)
 
 
 def save_records():
@@ -225,6 +261,7 @@ load_ntr_statuses()
 load_add_sessions()
 load_pending()
 load_drawn_pool()
+load_bonds()
 
 # ==================== 主插件类 ====================
 
@@ -270,6 +307,41 @@ class WifePlugin(Star):
             ntr_limit=self.ntr_max,
             swap_limit=self.swap_max_per_day,
         )
+        # ── 新增服务：本命/里程碑/补签/任务/作品图鉴/周榜/羁绊/季节卡池 ──
+        self.favorites = FavoritesService(
+            records,
+            list_provider=lambda: list(_list_cache_mem),
+            save_records_fn=save_records,
+            get_today_fn=get_today,
+            favorite_prob=self.favorite_prob,
+            change_cooldown_days=self.favorite_change_cooldown_days,
+        )
+        self.streak_freeze = StreakFreezeService(
+            records,
+            save_records_fn=save_records,
+            get_today_fn=get_today,
+            weekly_grant=self.streak_freeze_weekly_grant,
+        )
+        self.milestones = MilestoneService(records, save_records, self.favorites)
+        self.daily_quests = DailyQuestService(records, save_records, get_today, self.streak_freeze)
+        self.works_album = WorksAlbumService(
+            drawn_pool,
+            list_provider=lambda: list(_list_cache_mem),
+            records=records,
+            save_records_fn=save_records,
+            favorites_service=self.favorites,
+        )
+        self.weekly_settle = WeeklySettleService(
+            records,
+            drawn_pool,
+            save_records_fn=save_records,
+            get_today_fn=get_today,
+            default_enabled=self.weekly_settle_enabled,
+        )
+        self.bonds = BondsService(bonds_store, save_bonds, get_today)
+        self.season = SeasonService(self.season_pool_raw, get_today)
+        # 临时会话（补签 / 换本命确认等）走内存
+        self._pending_freeze: dict = {}  # {(gid, uid): expire_ts}
         # 启动时异步拉取 list 缓存
         asyncio.create_task(self._refresh_list_cache())
         # 启动时后台静默补全英文名缓存（限速慢跑，不影响正常使用）
@@ -316,6 +388,12 @@ class WifePlugin(Star):
         }
         # 去重池重置角色（全局）
         self.reset_char = self.config.get("reset_char", "")
+        # 新增功能配置
+        self.favorite_prob = float(self.config.get("favorite_prob", 0.25) or 0)
+        self.favorite_change_cooldown_days = int(self.config.get("favorite_change_cooldown_days", 30) or 30)
+        self.streak_freeze_weekly_grant = int(self.config.get("streak_freeze_weekly_grant", 1) or 0)
+        self.weekly_settle_enabled = bool(self.config.get("weekly_settle_enabled", True))
+        self.season_pool_raw = self.config.get("season_pool", "") or ""
         # 群组业力缓存清空（重载配置时重建）
         _karma_cache.clear()
 
@@ -398,6 +476,23 @@ class WifePlugin(Star):
             "解析角色": self.inspect_translation,
             "重译角色": self.retranslate_character,
             "pr上线": self.pr_online,
+            # 本命系统
+            "设置本命": self.setup_favorites,
+            "选本命": self.setup_favorites,
+            "查看本命": self.view_favorites,
+            "换本命": self.change_favorites,
+            # 补签 / 任务 / 羁绊 / 作品图鉴 / 周榜
+            "补签": self.do_streak_freeze,
+            "我的补签券": self.show_freeze_tickets,
+            "今日任务": self.show_daily_quests,
+            "领取任务奖励": self.claim_daily_quests,
+            "我的羁绊": self.show_bonds,
+            "作品图鉴": self.show_works_album,
+            "关闭周榜": self.disable_weekly,
+            "开启周榜": self.enable_weekly,
+            "上周战报": self.weekly_report,
+            # 管理员
+            "重置本命引导": self.admin_reset_favorite_intro,
         }
 
     def load_admins(self) -> list:
@@ -460,9 +555,29 @@ class WifePlugin(Star):
 
         text = event.message_str.strip()
 
-        # 先检查添老婆会话（waiting_input / waiting_choice）
+        # 先检查本命引导会话（picking 中）
         gid = str(event.message_obj.group_id)
         uid = str(event.get_sender_id())
+        fav_session = self.favorites.session(gid, uid)
+        if fav_session and fav_session.get("step") == "picking":
+            event.stop_event()
+            async for res in self._handle_favorite_session(event, fav_session, text):
+                yield res
+            return
+
+        # 补签确认会话
+        import time as _t_freeze
+        pf_key = (gid, uid)
+        if pf_key in self._pending_freeze:
+            if self._pending_freeze[pf_key] < _t_freeze.time():
+                self._pending_freeze.pop(pf_key, None)
+            elif text == "补签":
+                event.stop_event()
+                self._pending_freeze.pop(pf_key, None)
+                async for res in self._apply_streak_freeze(event):
+                    yield res
+                return
+
         session = add_sessions.get(gid, {}).get(uid)
         if session and session.get("step") == "waiting_choice":
             event.stop_event()
@@ -512,6 +627,43 @@ class WifePlugin(Star):
         nick = event.get_sender_name()
         today = get_today()
 
+        # ── 新用户引导：未设本命且未看过引导 → 启动选本命会话 ──
+        if not self.favorites.has_favorites(gid, uid) and not self.favorites.intro_seen(gid, uid):
+            self.favorites.mark_intro_seen(gid, uid)
+            # 第一次抽老婆：先选本命，再抽
+            if not records.get("draw_stats", {}).get(gid, {}).get(uid):
+                self.favorites.start_session(gid, uid)
+                yield event.plain_result(
+                    f"{nick}，欢迎入坑！先选 3 个本命，之后每次抽老婆有概率优先出她们。\n"
+                    f"请回复：本命 角色或作品关键词\n"
+                    f"（例如「本命 初音未来」或「本命 东方」）\n"
+                    f"不想选发「跳过」直接进入抽老婆。10 分钟内有效。"
+                )
+                return
+            else:
+                # 老用户：温和提示，但本次仍正常抽
+                yield event.plain_result(
+                    f"{nick}，新功能上线！发「设置本命」选 3 个本命，抽老婆有 "
+                    f"{int(self.favorite_prob*100)}% 概率优先出她们~"
+                )
+
+        # ── 每周首抽自动发补签券 ──
+        granted = self.streak_freeze.grant_weekly_if_due(gid, uid)
+        if granted:
+            yield event.plain_result(f"📨 周礼：补签券 +{granted}（共 {self.streak_freeze.tokens(gid, uid)} 张）")
+
+        # ── 断签提醒（昨天签过、今天还没签且有券） ──
+        if self.streak_freeze.streak_at_risk(gid, uid):
+            tokens = self.streak_freeze.tokens(gid, uid)
+            if tokens > 0:
+                import time as _t
+                self._pending_freeze[(gid, uid)] = _t.time() + 60
+                streak = int(records.get("draw_stats", {}).get(gid, {}).get(uid, {}).get("streak", 0) or 0)
+                yield event.plain_result(
+                    f"⚠️ 检测到昨天断签！你有 {tokens} 张补签券，"
+                    f"60 秒内回复「补签」可保住连签 {streak} 天。"
+                )
+
         # ── 今天已抽过：直接返回当天结果，不重复判定 ──
         async with get_config_lock(gid):
             _cfg_today = load_group_config(gid)
@@ -539,13 +691,40 @@ class WifePlugin(Star):
                 cfg = load_group_config(gid)
                 cfg[uid] = [karma_img, today, nick, "karma_locked"]
                 save_group_config(gid, cfg)
-            self._record_daily_draw(gid, uid, today)
+            bonuses = self._after_draw(gid, uid, today)
             msg += self._retention_hint(gid, uid)
+            for b in bonuses:
+                msg += "\n" + b
             img_comp = await self._resolve_wife_image(karma_img)
             if img_comp:
                 yield event.chain_result([Plain(msg), img_comp])
             else:
                 yield event.plain_result(msg)
+            return
+
+        # ── 季节限定卡池判定（开放期内 UP 优先） ──
+        season_img = self.season.roll(drawn_pool, gid, uid)
+        if season_img:
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [season_img, today, nick]
+                save_group_config(gid, cfg)
+            bonuses = self._after_draw(gid, uid, today)
+            _s_char = os.path.splitext(season_img)[0].split("/")[-1].split("!")[-1] if season_img else ""
+            _s_src = os.path.splitext(season_img)[0].split("/")[-1].split("!")[0] if "!" in season_img else ""
+            _s_text = (
+                f"{nick}，✨[{self.season.name()}] 今天的老婆是来自《{_s_src}》的{_s_char}～"
+                if _s_src else
+                f"{nick}，✨[{self.season.name()}] 今天的老婆是{_s_char}～"
+            )
+            _s_text += self._retention_hint(gid, uid)
+            for b in bonuses:
+                _s_text += "\n" + b
+            img_comp = await self._resolve_wife_image(season_img)
+            if img_comp:
+                yield event.chain_result([Plain(_s_text), img_comp])
+            else:
+                yield event.plain_result(_s_text)
             return
 
         # ── 常驻 UP 池判定 ──
@@ -555,7 +734,7 @@ class WifePlugin(Star):
                 cfg = load_group_config(gid)
                 cfg[uid] = [pool_img, today, nick]
                 save_group_config(gid, cfg)
-            self._record_daily_draw(gid, uid, today)
+            bonuses = self._after_draw(gid, uid, today)
             _p_char = os.path.splitext(pool_img)[0].split("/")[-1].split("!")[-1] if pool_img else ""
             _p_src  = os.path.splitext(pool_img)[0].split("/")[-1].split("!")[0]  if "!" in pool_img else ""
             _p_text = (
@@ -564,11 +743,38 @@ class WifePlugin(Star):
                 f"{nick}，[UP] 今天的老婆是{_p_char}～"
             )
             _p_text += self._retention_hint(gid, uid)
+            for b in bonuses:
+                _p_text += "\n" + b
             img_comp = await self._resolve_wife_image(pool_img)
             if img_comp:
                 yield event.chain_result([Plain(_p_text), img_comp])
             else:
                 yield event.plain_result(_p_text)
+            return
+
+        # ── 个人本命 UP 判定 ──
+        fav_img = self.favorites.roll_favorite(gid, uid, drawn_pool)
+        if fav_img:
+            async with get_config_lock(gid):
+                cfg = load_group_config(gid)
+                cfg[uid] = [fav_img, today, nick]
+                save_group_config(gid, cfg)
+            bonuses = self._after_draw(gid, uid, today)
+            _f_char = os.path.splitext(fav_img)[0].split("/")[-1].split("!")[-1] if fav_img else ""
+            _f_src = os.path.splitext(fav_img)[0].split("/")[-1].split("!")[0] if "!" in fav_img else ""
+            _f_text = (
+                f"{nick}，💖[本命] 今天的老婆是来自《{_f_src}》的{_f_char}～"
+                if _f_src else
+                f"{nick}，💖[本命] 今天的老婆是{_f_char}～"
+            )
+            _f_text += self._retention_hint(gid, uid)
+            for b in bonuses:
+                _f_text += "\n" + b
+            img_comp = await self._resolve_wife_image(fav_img)
+            if img_comp:
+                yield event.chain_result([Plain(_f_text), img_comp])
+            else:
+                yield event.plain_result(_f_text)
             return
 
         # ── 单角色 UP 池判定 ──
@@ -578,7 +784,7 @@ class WifePlugin(Star):
                 cfg = load_group_config(gid)
                 cfg[uid] = [up_img, today, nick]
                 save_group_config(gid, cfg)
-            self._record_daily_draw(gid, uid, today)
+            bonuses = self._after_draw(gid, uid, today)
             _up_char = os.path.splitext(up_img)[0].split("/")[-1].split("!")[-1] if up_img else ""
             _up_src  = os.path.splitext(up_img)[0].split("/")[-1].split("!")[0]  if "!" in up_img else ""
             _up_text = (
@@ -587,6 +793,8 @@ class WifePlugin(Star):
                 f"{nick}，[UP] 今天的老婆是{_up_char}～"
             )
             _up_text += self._retention_hint(gid, uid)
+            for b in bonuses:
+                _up_text += "\n" + b
             img_comp = await self._resolve_wife_image(up_img)
             if img_comp:
                 yield event.chain_result([Plain(_up_text), img_comp])
@@ -614,10 +822,15 @@ class WifePlugin(Star):
                 cfg = load_group_config(gid)
                 cfg[uid] = [img, today, nick]
                 save_group_config(gid, cfg)
-            self._record_daily_draw(gid, uid, today)
+            bonuses = self._after_draw(gid, uid, today)
+        else:
+            bonuses = []
 
         # 生成并发送消息
-        yield event.chain_result(await self._build_wife_message(img, nick, gid=gid, uid=uid))
+        result = await self._build_wife_message(img, nick, gid=gid, uid=uid)
+        if bonuses and result and isinstance(result[0], Plain):
+            result[0] = Plain(result[0].text + "\n" + "\n".join(bonuses))
+        yield event.chain_result(result)
 
     def _is_valid_img_path(self, img: str) -> bool:
         """校验图片路径是否合法（必须含!且有图片扩展名）"""
@@ -699,6 +912,9 @@ class WifePlugin(Star):
         if not all_lines:
             return None
 
+        # 季节卡池：期间外剔除限定角色
+        all_lines = self.season.filter_pool(all_lines)
+
         # 去重池过滤
         drawn = set(drawn_pool.get(gid, {}).get(uid, []))
         available = [l for l in all_lines if l not in drawn]
@@ -730,6 +946,33 @@ class WifePlugin(Star):
     def _record_daily_draw(self, gid: str, uid: str, today: str) -> dict:
         """记录用户每日首次抽取，用于连续天数和累计抽取展示。"""
         return self.retention.record_daily_draw(gid, uid, today)
+
+    def _after_draw(self, gid: str, uid: str, today: str) -> list[str]:
+        """每次抽老婆成功后调用：记录、任务进度、里程碑、作品图鉴。返回额外播报文本列表。"""
+        stats = self.retention.record_daily_draw(gid, uid, today)
+        msgs = []
+        # 任务进度
+        done = self.daily_quests.mark(gid, uid, "draw")
+        for d in done:
+            msgs.append(f"📜 完成任务：{d}")
+        # 作品图鉴完成检测
+        new_works = self.works_album.check_completion(gid, uid)
+        for w in new_works:
+            msgs.append(f"🏆 集齐《{w}》全角色！获得换本命券 ×1")
+        # 里程碑
+        streak = int(stats.get("streak", 0) or 0)
+        seen, total, pct = self.retention.album_summary(gid, uid)
+        for m in self.milestones.check(gid, uid, streak=streak, album_pct=pct):
+            r = m["rewards"]
+            parts = []
+            if r.get("freeze_ticket"):
+                parts.append(f"补签券 ×{r['freeze_ticket']}")
+            if r.get("favorite_ticket"):
+                parts.append(f"换本命券 ×{r['favorite_ticket']}")
+            if r.get("title"):
+                parts.append(f"称号「{r['title']}」")
+            msgs.append(f"🎖 里程碑：{m['desc']} → " + "，".join(parts))
+        return msgs
 
     def _get_draw_stats(self, gid: str, uid: str) -> dict:
         return self.retention.get_draw_stats(gid, uid)
@@ -844,9 +1087,25 @@ class WifePlugin(Star):
 • 我的老婆申请 - 查看自己提交的审核进度
 • 解析角色 角色名/作品名 - 查看翻译档案与搜索用别名
 
+【本命系统】
+• 设置本命 - 选 3 个本命，抽老婆有概率优先出
+• 查看本命 - 查看当前本命和换本命冷却
+• 换本命 - 每月 1 次免费，否则消耗换本命券
+• 本命 关键词 - 引导会话中搜索角色
+
+【留存增强】
+• 今日任务 - 查看今日 3 个任务
+• 领取任务奖励 - 完成任意 2 个后领补签券
+• 补签 / 我的补签券 - 断签时保住连签
+• 我的羁绊 - 查看与其他群友的 CP/羁绊
+• 作品图鉴 [作品名] - 按作品聚合的图鉴
+• 上周战报 - 手动查看上周连签/图鉴榜
+
 【管理员命令】
 • 切换ntr开关状态 - 开启/关闭NTR功能
 • 重译角色 角色名/作品名 - 清除缓存并重新解析角色
+• 关闭周榜 / 开启周榜 - 控制本群周一战报播报
+• 重置本命引导 - 让没设本命的群友再次看到提示
 
 💡 提示：部分命令有每日使用次数限制
 """
@@ -877,18 +1136,42 @@ class WifePlugin(Star):
     async def today_wife_board(self, event: AstrMessageEvent):
         """查看本群今日老婆榜"""
         gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
         today = get_today()
         cfg = load_group_config(gid)
         rows = self.retention.today_wife_rows(cfg, today)
+
+        self.daily_quests.mark(gid, uid, "board")
+
+        # 顺手触发周榜结算（懒触发）
+        if self.weekly_settle.needs_settle(gid):
+            report = self.weekly_settle.build_report(gid, cfg)
+            if report:
+                yield event.plain_result(report)
+            self.weekly_settle.mark_settled(gid)
 
         if not rows:
             yield event.plain_result("今天还没人抽老婆。发「抽老婆」拿下本群第一抽吧~")
             return
 
+        # 加挂活跃羁绊称号
+        uid_by_nick: dict = {}
+        for u, data in cfg.items():
+            if isinstance(data, list) and len(data) >= 3:
+                uid_by_nick[data[2]] = u
+
         random.shuffle(rows)
         lines = [f"今日老婆榜（{len(rows)} 人已抽）"]
         for i, (nick, wife_name) in enumerate(rows[:15], 1):
-            lines.append(f"{i}. {nick}：{wife_name}")
+            u = uid_by_nick.get(nick)
+            title_str = ""
+            if u:
+                titles = self.bonds.active_titles(gid, u)
+                if titles:
+                    t, other = titles[0]
+                    other_nick = (cfg.get(other) or [None, None, other])[2]
+                    title_str = f"  ［{t}→{other_nick}］"
+            lines.append(f"{i}. {nick}：{wife_name}{title_str}")
         if len(rows) > 15:
             lines.append(f"...还有 {len(rows) - 15} 人")
         yield event.plain_result("\n".join(lines))
@@ -1006,7 +1289,9 @@ class WifePlugin(Star):
             rec["count"] += 1
             grp[uid] = rec
             save_records()
-            
+            # 任务进度（尝试即算）
+            self.daily_quests.mark(gid, uid, "ntr")
+
             # 判断牛老婆是否成功
             if _roll(self.ntr_possibility):
                 # 牛成功：目标用户的老婆转给牛者
@@ -1014,10 +1299,12 @@ class WifePlugin(Star):
                 cfg[uid] = [img, today, nick]
                 del cfg[tid]
                 save_group_config(gid, cfg)
-                
+                # 记录羁绊（uid 牛走了 tid）
+                self.bonds.record(gid, uid, tid, "ntr")
+
                 # 取消相关交换请求
                 cancel_msg = self.cancel_swap_on_wife_change(gid, [uid, tid])
-                
+
                 yield event.plain_result(f"{nick}，牛老婆成功！老婆已归你所有，恭喜恭喜~")
                 if cancel_msg:
                     yield event.plain_result(cancel_msg)
@@ -1100,11 +1387,14 @@ class WifePlugin(Star):
         recs[uid] = rec
         save_records()
         
+        # 任务进度
+        self.daily_quests.mark(gid, uid, "change")
+
         # 取消相关交换请求
         cancel_msg = self.cancel_swap_on_wife_change(gid, [uid])
         if cancel_msg:
             yield event.plain_result(cancel_msg)
-        
+
         # 立即展示新老婆
         async for res in self.animewife(event):
             yield res
@@ -1296,7 +1586,12 @@ class WifePlugin(Star):
             cfg = load_group_config(gid)
             cfg[uid][0], cfg[tid][0] = cfg[tid][0], cfg[uid][0]
             save_group_config(gid, cfg)
-        
+
+        # 任务进度 + 羁绊
+        self.daily_quests.mark(gid, uid, "swap_done")
+        self.daily_quests.mark(gid, tid, "swap_done")
+        self.bonds.record(gid, uid, tid, "swap")
+
         # 保存交换请求删除
         save_swap_requests()
         
@@ -1413,6 +1708,7 @@ class WifePlugin(Star):
         yield event.plain_result(f"正在以「{display}」搜索本子，请稍候...")
 
         result = await self._hentai_searcher.search(char=char_name, source=source_name)
+        self.daily_quests.mark(gid, uid, "hentai")
         yield event.plain_result(result.format_text())
 
     # ==================== AI 翻译（代理到 HentaiSearcher）====================
@@ -1438,6 +1734,12 @@ class WifePlugin(Star):
             yield event.plain_result("用法：解析角色 角色名/作品名\n例如：解析角色 紫苑/eden*")
             return
         char, source = parsed
+        try:
+            self.daily_quests.mark(
+                str(event.message_obj.group_id), str(event.get_sender_id()), "inspect"
+            )
+        except Exception:
+            pass
         cached = self._get_translation_from_cache(char, source)
         trans = cached or await self._ai_translate_multi(char=char, source=source)
         if not trans:
@@ -2710,6 +3012,291 @@ query ($search: String) {
         if raw in pending_queue:
             return raw
         return None
+
+    # ==================== 本命系统 ====================
+
+    async def setup_favorites(self, event: AstrMessageEvent):
+        """手动开启本命选择会话"""
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        if self.favorites.has_favorites(gid, uid):
+            yield event.plain_result(f"{nick}，你已经设置过本命啦。想改请发「换本命」~")
+            return
+        self.favorites.start_session(gid, uid)
+        yield event.plain_result(
+            f"{nick}，开始选本命（3 个，10 分钟内有效）。\n"
+            f"回复：本命 角色或作品关键词\n"
+            f"不想选发「跳过」即可~"
+        )
+
+    async def view_favorites(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        rec = self.favorites.get_record(gid, uid)
+        chars = rec.get("chars") or []
+        if not chars:
+            yield event.plain_result("你还没设置本命，发「设置本命」开始挑 3 个~")
+            return
+        free_ok, days_left = self.favorites.can_change_for_free(gid, uid)
+        tickets = int(rec.get("tickets", 0) or 0)
+        lines = ["你的本命："]
+        for i, c in enumerate(chars, 1):
+            lines.append(f"{i}. {FavoritesService._display(c)}")
+        lines.append(f"本命 UP 概率：{int(self.favorite_prob*100)}%")
+        if free_ok:
+            lines.append("可免费换本命：发「换本命」开始")
+        else:
+            lines.append(f"距离免费换本命还有 {days_left} 天；现有换本命券：{tickets}")
+        yield event.plain_result("\n".join(lines))
+
+    async def change_favorites(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        rec = self.favorites.get_record(gid, uid)
+        if not rec.get("chars"):
+            async for r in self.setup_favorites(event):
+                yield r
+            return
+        free_ok, days_left = self.favorites.can_change_for_free(gid, uid)
+        if not free_ok:
+            if not self.favorites.use_ticket(gid, uid):
+                yield event.plain_result(
+                    f"{nick}，距离免费换本命还有 {days_left} 天，"
+                    f"也没有换本命券。可通过里程碑/集齐作品获得~"
+                )
+                return
+            yield event.plain_result(f"已消耗换本命券 ×1（剩余 {int(rec.get('tickets', 0) or 0)} 张）")
+        # 清空旧本命并启动会话
+        rec["chars"] = []
+        save_records()
+        self.favorites.start_session(gid, uid)
+        yield event.plain_result(
+            f"{nick}，请重新选 3 个本命。\n回复：本命 角色或作品关键词；发「跳过」结束。"
+        )
+
+    async def _handle_favorite_session(self, event, session: dict, text: str):
+        """本命引导会话内的消息分发。"""
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        self.favorites.touch_session(session)
+
+        # 用户在等候选数字
+        if session.get("candidates"):
+            if text == "取消":
+                self.favorites.clear_session(gid, uid)
+                yield event.plain_result("已取消本命选择~")
+                return
+            if text == "跳过":
+                # 跳过当前位
+                session["candidates"] = []
+                if not session.get("picked"):
+                    self.favorites.commit_picks(gid, uid, [])
+                    self.favorites.clear_session(gid, uid)
+                    yield event.plain_result("已跳过本命设置，下次想用发「设置本命」~")
+                    return
+                yield event.plain_result(f"已跳过当前候选，已选 {len(session['picked'])} 个。继续发「本命 关键词」选下一个，或「跳过」结束。")
+                if len(session["picked"]) >= FavoritesService.MAX_PICKS:
+                    self.favorites.commit_picks(gid, uid, session["picked"])
+                    self.favorites.clear_session(gid, uid)
+                    yield event.plain_result("本命已锁定 ✅ 现在去抽老婆吧~")
+                return
+            if text.isdigit():
+                idx = int(text) - 1
+                cands = session["candidates"]
+                if not (0 <= idx < len(cands)):
+                    yield event.plain_result(f"请输入 1~{len(cands)} 的数字")
+                    return
+                chosen = cands[idx]
+                if chosen in session["picked"]:
+                    yield event.plain_result("已经选过这位了，换一个~")
+                    return
+                session["picked"].append(chosen)
+                session["candidates"] = []
+                left = FavoritesService.MAX_PICKS - len(session["picked"])
+                yield event.plain_result(
+                    f"已加入本命：{FavoritesService._display(chosen)}（{len(session['picked'])}/{FavoritesService.MAX_PICKS}）"
+                )
+                if left <= 0:
+                    self.favorites.commit_picks(gid, uid, session["picked"])
+                    self.favorites.clear_session(gid, uid)
+                    yield event.plain_result("本命已锁定 ✅ 现在去抽老婆吧~")
+                else:
+                    yield event.plain_result(f"再选 {left} 个，回复「本命 关键词」继续；不想选发「跳过」。")
+                return
+            # 其他文本：当作新搜索关键词处理
+            # fallthrough
+
+        # 搜索新关键词
+        if text == "跳过":
+            self.favorites.commit_picks(gid, uid, session.get("picked", []))
+            self.favorites.clear_session(gid, uid)
+            n = len(session.get("picked", []))
+            if n > 0:
+                yield event.plain_result(f"已锁定 {n} 个本命（其余位空着）。去抽老婆吧~")
+            else:
+                yield event.plain_result("已跳过本命设置，下次想用发「设置本命」~")
+            return
+        if text == "取消":
+            self.favorites.clear_session(gid, uid)
+            yield event.plain_result("已取消本命选择~")
+            return
+        if not text.startswith("本命"):
+            # 不是会话指令，忽略不打断别人聊天
+            return
+        kw = text[2:].strip()
+        if not kw:
+            yield event.plain_result("用法：本命 角色或作品关键词")
+            return
+        results = self.favorites.search(kw, limit=10)
+        # 过滤已选
+        results = [r for r in results if r not in session["picked"]]
+        if not results:
+            yield event.plain_result(
+                f"没找到「{kw}」相关的角色。\n"
+                f"可能还没收录，发「添老婆 {kw}/作品名」提交一下；或换个关键词再试~"
+            )
+            return
+        if len(results) > 10:
+            yield event.plain_result("候选太多，请再具体一点（带作品名更准）。")
+            return
+        session["candidates"] = results
+        lines = [f"找到这些（回复数字选一个，不要发「跳过」换关键词）："]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {FavoritesService._display(r)}")
+        yield event.plain_result("\n".join(lines))
+
+    async def admin_reset_favorite_intro(self, event: AstrMessageEvent):
+        uid = str(event.get_sender_id())
+        if uid not in self.admins:
+            yield event.plain_result("只有管理员才能用这个~")
+            return
+        gid = str(event.message_obj.group_id)
+        cnt = 0
+        for u, rec in records.get("favorites", {}).get(gid, {}).items():
+            if rec.get("intro_seen") and not rec.get("chars"):
+                rec["intro_seen"] = False
+                cnt += 1
+        save_records()
+        yield event.plain_result(f"已重置 {cnt} 位用户的本命引导，他们下次抽老婆会重新看到提示。")
+
+    # ==================== 补签 / 任务 / 羁绊 / 作品图鉴 / 周榜 ====================
+
+    async def _apply_streak_freeze(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        ok, streak = self.streak_freeze.apply_freeze(gid, uid)
+        if not ok:
+            yield event.plain_result(f"{nick}，补签券不够了~")
+            return
+        yield event.plain_result(
+            f"{nick}，补签成功 ✅ 保住连签 {streak} 天。剩余补签券：{self.streak_freeze.tokens(gid, uid)}\n现在去「抽老婆」吧。"
+        )
+
+    async def do_streak_freeze(self, event: AstrMessageEvent):
+        """主动用补签券（在提示窗外手动调用）"""
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        if not self.streak_freeze.streak_at_risk(gid, uid):
+            yield event.plain_result("当前没有断签风险~")
+            return
+        async for r in self._apply_streak_freeze(event):
+            yield r
+
+    async def show_freeze_tickets(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        yield event.plain_result(f"你的补签券：{self.streak_freeze.tokens(gid, uid)} 张")
+
+    async def show_daily_quests(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        yield event.plain_result(self.daily_quests.render(gid, uid))
+
+    async def claim_daily_quests(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        ok, msg = self.daily_quests.claim(gid, uid)
+        yield event.plain_result(msg)
+
+    async def show_bonds(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        cfg = load_group_config(gid)
+        rows = self.bonds.list_for_user(gid, uid)
+        if not rows:
+            yield event.plain_result("你还没有任何羁绊。试试和别人交换/牛老婆~")
+            return
+        lines = ["你的羁绊："]
+        for r in rows[:10]:
+            other_nick = (cfg.get(r["other"]) or [None, None, r["other"]])[2]
+            tag = ("「" + "/".join(r["titles"]) + "」") if r["titles"] else ""
+            lines.append(
+                f"- {other_nick}：交换 {r['swap']}、牛走 {r['ntr_to_other']}、被牛 {r['ntr_from_other']} {tag}"
+            )
+        yield event.plain_result("\n".join(lines))
+
+    async def show_works_album(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        uid = str(event.get_sender_id())
+        msg = event.message_str.strip()
+        parts = msg.split(maxsplit=1)
+        if len(parts) >= 2 and parts[1].strip():
+            source = parts[1].strip()
+            owned, full = self.works_album.work_detail(gid, uid, source)
+            if not full:
+                yield event.plain_result(f"没找到作品《{source}》。试试「作品图鉴」看你已经开始的作品。")
+                return
+            missing = full - owned
+            lines = [f"《{source}》图鉴：{len(owned)}/{len(full)}"]
+            if missing:
+                lines.append("尚缺：" + "、".join(sorted(missing)[:20]))
+                if len(missing) > 20:
+                    lines.append(f"…还有 {len(missing) - 20} 位")
+            else:
+                lines.append("已通关 ✅")
+            yield event.plain_result("\n".join(lines))
+            return
+        rows = self.works_album.user_progress(gid, uid)
+        if not rows:
+            yield event.plain_result("还没开始任何作品图鉴。多抽几个老婆吧~")
+            return
+        lines = ["作品图鉴："]
+        for s, o, t, done in rows[:15]:
+            mark = " ✅" if done else ""
+            lines.append(f"- 《{s}》：{o}/{t}{mark}")
+        lines.append("\n用「作品图鉴 作品名」看具体缺谁。")
+        yield event.plain_result("\n".join(lines))
+
+    async def disable_weekly(self, event: AstrMessageEvent):
+        uid = str(event.get_sender_id())
+        if uid not in self.admins:
+            yield event.plain_result("只有管理员能改本群周榜开关~")
+            return
+        gid = str(event.message_obj.group_id)
+        self.weekly_settle.set_enabled(gid, False)
+        yield event.plain_result("已关闭本群周榜播报。发「开启周榜」可重新打开。")
+
+    async def enable_weekly(self, event: AstrMessageEvent):
+        uid = str(event.get_sender_id())
+        if uid not in self.admins:
+            yield event.plain_result("只有管理员能改本群周榜开关~")
+            return
+        gid = str(event.message_obj.group_id)
+        self.weekly_settle.set_enabled(gid, True)
+        yield event.plain_result("已开启本群周榜播报。")
+
+    async def weekly_report(self, event: AstrMessageEvent):
+        gid = str(event.message_obj.group_id)
+        cfg = load_group_config(gid)
+        report = self.weekly_settle.build_report(gid, cfg)
+        if not report:
+            yield event.plain_result("上周还没有数据~")
+            return
+        yield event.plain_result(report)
 
     async def terminate(self):
         """插件卸载时清理资源"""
