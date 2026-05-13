@@ -222,9 +222,12 @@
         "hint": "默认是否在周一 00:05 自动播报上周战报。各群可发「关闭周榜/开启周榜」单独控制"
     },
     "season_pool": {
+        "type": "text",
         "description": "季节限定卡池配置",
-        "type": "string",
-        "default": "",
-        "hint": "JSON 字符串，结构 {name, start, end, chars: [\"作品!角色.jpg\"], rate_up}。期间内 chars 走限定 UP，且不会出现在普通池"
+        "hint": "JSON 配置：{name, start, end, chars: [...], rate_up}。期间内 chars 走限定 UP；期间外自动从普通池剔除。留空字符串 \"\" 表示不启用。",
+        "editor_mode": true,
+        "editor_language": "json",
+        "editor_theme": "vs-dark",
+        "default": "{\n  \"name\": \"示例-未启用\",\n  \"start\": \"\",\n  \"end\": \"\",\n  \"chars\": [],\n  \"rate_up\": 0.30\n}"
     }
 }
