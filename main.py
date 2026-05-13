@@ -494,6 +494,11 @@ class WifePlugin(Star):
             "上周战报": self.weekly_report,
             # 管理员
             "重置本命引导": self.admin_reset_favorite_intro,
+            "发券": self.admin_grant_ticket,
+            "查券": self.admin_view_tickets,
+            "加称号": self.admin_grant_title,
+            "重置任务": self.admin_reset_quests,
+            "清本命": self.admin_clear_favorites,
         }
 
     def load_admins(self) -> list:
@@ -3565,6 +3570,144 @@ query ($search: String) {
                 cnt += 1
         save_records()
         yield event.plain_result(f"已重置 {cnt} 位用户的本命引导，他们下次抽老婆会重新看到提示。")
+
+    # ==================== 管理员：发券 / 查券 / 称号 / 重置 ====================
+
+    def _admin_check(self, event: AstrMessageEvent) -> bool:
+        return str(event.get_sender_id()) in self.admins
+
+    def _parse_admin_args(self, event: AstrMessageEvent, cmd: str) -> tuple[str, list[str]]:
+        """从消息里拆出 @目标 uid 和剩余参数（按空格切）。
+        没有 @ 则 tid 为空字符串。
+        """
+        tid = self.parse_at_target(event) or ""
+        msg = event.message_str.strip()
+        if msg.startswith(cmd):
+            rest = msg[len(cmd):].strip()
+        else:
+            rest = msg
+        # 去掉 @ 占位符（部分平台保留为 [CQ:at,qq=...] 或 "@昵称 "）
+        rest = re.sub(r"\[CQ:at,[^\]]+\]", "", rest)
+        rest = re.sub(r"@\S+\s*", "", rest)
+        tokens = rest.split()
+        return tid, tokens
+
+    async def admin_grant_ticket(self, event: AstrMessageEvent):
+        """发券 @用户 补签|本命 [N]"""
+        if not self._admin_check(event):
+            yield event.plain_result("只有管理员能发券~")
+            return
+        gid = str(event.message_obj.group_id)
+        tid, tokens = self._parse_admin_args(event, "发券")
+        if not tid:
+            yield event.plain_result("用法：发券 @用户 补签|本命 [N]")
+            return
+        if len(tokens) < 1:
+            yield event.plain_result("用法：发券 @用户 补签|本命 [N]")
+            return
+        kind = tokens[0]
+        try:
+            n = int(tokens[1]) if len(tokens) >= 2 else 1
+        except ValueError:
+            yield event.plain_result("数量必须是整数")
+            return
+        if n <= 0 or n > 99:
+            yield event.plain_result("数量请在 1~99 之间")
+            return
+
+        if kind in ("补签", "补签券", "freeze"):
+            cur = records.setdefault("streak_freeze", {}).setdefault(gid, {}).setdefault(
+                tid, {"tokens": 0, "last_grant_week": ""}
+            )
+            cur["tokens"] = int(cur.get("tokens", 0) or 0) + n
+            save_records()
+            yield event.chain_result([
+                Plain("已发"), At(qq=int(tid)), Plain(f" 补签券 ×{n}（当前 {cur['tokens']} 张）")
+            ])
+        elif kind in ("本命", "换本命", "favorite"):
+            total = self.favorites.add_ticket(gid, tid, n)
+            yield event.chain_result([
+                Plain("已发"), At(qq=int(tid)), Plain(f" 换本命券 ×{n}（当前 {total} 张）")
+            ])
+        else:
+            yield event.plain_result("券类型：补签 / 本命")
+
+    async def admin_view_tickets(self, event: AstrMessageEvent):
+        """查券 @用户"""
+        if not self._admin_check(event):
+            yield event.plain_result("只有管理员能查别人的券~")
+            return
+        gid = str(event.message_obj.group_id)
+        tid, _ = self._parse_admin_args(event, "查券")
+        if not tid:
+            yield event.plain_result("用法：查券 @用户")
+            return
+        freeze = int(records.get("streak_freeze", {}).get(gid, {}).get(tid, {}).get("tokens", 0) or 0)
+        fav_rec = self.favorites.get_record(gid, tid)
+        fav = int(fav_rec.get("tickets", 0) or 0)
+        titles = records.get("titles", {}).get(gid, {}).get(tid, [])
+        title_str = "、".join(titles) if titles else "无"
+        yield event.chain_result([
+            At(qq=int(tid)),
+            Plain(f"\n补签券：{freeze}\n换本命券：{fav}\n称号：{title_str}")
+        ])
+
+    async def admin_grant_title(self, event: AstrMessageEvent):
+        """加称号 @用户 称号文字"""
+        if not self._admin_check(event):
+            yield event.plain_result("只有管理员能颁发称号~")
+            return
+        gid = str(event.message_obj.group_id)
+        tid, tokens = self._parse_admin_args(event, "加称号")
+        if not tid or not tokens:
+            yield event.plain_result("用法：加称号 @用户 称号文字")
+            return
+        title = " ".join(tokens).strip()
+        if len(title) > 20:
+            yield event.plain_result("称号最长 20 字")
+            return
+        titles = records.setdefault("titles", {}).setdefault(gid, {}).setdefault(tid, [])
+        if title in titles:
+            yield event.plain_result(f"已存在称号「{title}」")
+            return
+        titles.append(title)
+        save_records()
+        yield event.chain_result([
+            Plain("已颁发称号「"), Plain(title), Plain("」给 "), At(qq=int(tid))
+        ])
+
+    async def admin_reset_quests(self, event: AstrMessageEvent):
+        """重置任务 [@用户]"""
+        if not self._admin_check(event):
+            yield event.plain_result("只有管理员能重置任务~")
+            return
+        gid = str(event.message_obj.group_id)
+        tid = self.parse_at_target(event) or str(event.get_sender_id())
+        if records.get("daily_quests", {}).get(gid, {}).pop(tid, None):
+            save_records()
+            yield event.chain_result([Plain("已重置"), At(qq=int(tid)), Plain(" 的今日任务。")])
+        else:
+            yield event.plain_result("对方今天还没有任务记录。")
+
+    async def admin_clear_favorites(self, event: AstrMessageEvent):
+        """清本命 @用户"""
+        if not self._admin_check(event):
+            yield event.plain_result("只有管理员能清别人的本命~")
+            return
+        gid = str(event.message_obj.group_id)
+        tid, _ = self._parse_admin_args(event, "清本命")
+        if not tid:
+            yield event.plain_result("用法：清本命 @用户")
+            return
+        rec = records.get("favorites", {}).get(gid, {}).get(tid)
+        if not rec or not rec.get("chars"):
+            yield event.plain_result("对方还没设过本命。")
+            return
+        rec["chars"] = []
+        rec["set_at"] = ""
+        rec["intro_seen"] = False
+        save_records()
+        yield event.chain_result([Plain("已清空"), At(qq=int(tid)), Plain(" 的本命，对方下次抽老婆会重走引导。")])
 
     # ==================== 补签 / 任务 / 羁绊 / 作品图鉴 / 周榜 ====================
 
