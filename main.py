@@ -649,6 +649,12 @@ class WifePlugin(Star):
             "同意交换": self.agree_swap_wife,
             "拒绝交换": self.reject_swap_wife,
             "查看交换请求": self.view_swap_requests,
+            # 群友联动开关（每人每群独立）
+            "关闭群友联动": self.disable_wp_link,
+            "关闭抽群友": self.disable_wp_link,
+            "开启群友联动": self.enable_wp_link,
+            "开启抽群友": self.enable_wp_link,
+            "群友联动状态": self.show_wp_link_status,
             "要本子": self.get_hentai,
             "添老婆": self.add_wife,
             "我的老婆申请": self.my_wife_submissions,
@@ -819,11 +825,74 @@ class WifePlugin(Star):
                 return mod
         return None
 
+    async def disable_wp_link(self, event: AstrMessageEvent):
+        """关闭群友联动：抽老婆不再附带 wifepicker 群友消息。"""
+        gid = str(event.message_obj.group_id) if event.message_obj else ""
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        if not gid:
+            yield event.plain_result("此功能仅在群聊中可用~")
+            return
+        self._set_wp_link_opt_out(gid, uid, True)
+        yield event.plain_result(
+            f"{nick}，已关闭本群群友联动。\n"
+            "之后发「抽老婆」只会出二次元老婆，不会再附带群友老婆消息。\n"
+            "想开回来发「开启群友联动」。"
+        )
+
+    async def enable_wp_link(self, event: AstrMessageEvent):
+        """开启群友联动。"""
+        gid = str(event.message_obj.group_id) if event.message_obj else ""
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        if not gid:
+            yield event.plain_result("此功能仅在群聊中可用~")
+            return
+        self._set_wp_link_opt_out(gid, uid, False)
+        yield event.plain_result(
+            f"{nick}，已开启本群群友联动，下次抽老婆就会附带群友老婆 + 同担提示。"
+        )
+
+    async def show_wp_link_status(self, event: AstrMessageEvent):
+        """查看自己当前的群友联动开关。"""
+        gid = str(event.message_obj.group_id) if event.message_obj else ""
+        uid = str(event.get_sender_id())
+        nick = event.get_sender_name()
+        if not gid:
+            yield event.plain_result("此功能仅在群聊中可用~")
+            return
+        opted_out = str(uid) in self._wp_link_opt_out_set(gid)
+        state = "❌ 已关闭" if opted_out else "✅ 已开启"
+        yield event.plain_result(
+            f"{nick}，本群群友联动状态：{state}\n"
+            "切换发「关闭群友联动」/「开启群友联动」。"
+        )
+
+    def _wp_link_opt_out_set(self, gid: str) -> set:
+        """读取该群所有关闭联动的用户 uid 集合。"""
+        bucket = records.setdefault("wp_link_opt_out", {})
+        return set(bucket.get(str(gid), []))
+
+    def _set_wp_link_opt_out(self, gid: str, uid: str, opted_out: bool) -> None:
+        bucket = records.setdefault("wp_link_opt_out", {})
+        cur = set(bucket.get(str(gid), []))
+        if opted_out:
+            cur.add(str(uid))
+        else:
+            cur.discard(str(uid))
+        bucket[str(gid)] = sorted(cur)
+        save_records()
+
     async def _yield_wifepicker_link(self, event, gid: str, uid: str, nick: str, anime_img: str):
         """抽完二次元老婆后反向调 wifepicker 抽今日群友，并把消息追加输出。
         wifepicker 未加载或调用失败时静默跳过。
         每个用户每天每群只联动一次（避免「换老婆」/重复抽老婆刷屏）。
+        用户可发「关闭群友联动」单独禁用。
         """
+        # 用户主动关闭则跳过
+        if str(uid) in self._wp_link_opt_out_set(gid):
+            logger.info(f"[联动] {gid}:{uid} 已关闭群友联动，跳过")
+            return
         # 每日每人去重：解决 换老婆→animewife 重入 / 重复抽老婆 / 子命令复用 等场景刷屏
         today = get_today()
         cache = getattr(self, "_wp_link_today", None)
